@@ -32,11 +32,17 @@ class StorageManager:
                 self.logger.error(error_msg)
                 return False, error_msg, None
             
-            # Check for duplicates
+            # Check for duplicates - both content_hash and URL
             existing_doc = self._check_duplicate(validation_result.normalized_data['content_hash'])
             if existing_doc:
-                self.logger.info(f"Duplicate document found: {existing_doc['title']} (ID: {existing_doc['id']})")
+                self.logger.info(f"Duplicate document found by content: {existing_doc['title']} (ID: {existing_doc['id']})")
                 return True, f"Document already exists: {existing_doc['title']}", existing_doc['id']
+            
+            # Check for URL duplicates
+            url_duplicate = self._check_url_duplicate(validation_result.normalized_data['url'])
+            if url_duplicate:
+                self.logger.info(f"Duplicate document found by URL: {url_duplicate['title']} (ID: {url_duplicate['id']})")
+                return True, f"Document already exists: {url_duplicate['title']}", url_duplicate['id']
             
             # Insert document with duplicate handling
             try:
@@ -48,30 +54,72 @@ class StorageManager:
                 # More comprehensive constraint error detection
                 if any(phrase in error_msg for phrase in [
                     "UNIQUE constraint failed: documents.content_hash",
+                    "UNIQUE constraint failed: documents.url", 
                     "UNIQUE constraint failed",
                     "constraint failed",
                     "integrity error"
                 ]):
                     self.logger.info(f"🔍 UNIQUE constraint violation detected: {error_msg}")
                     
-                    # Check if there's a deleted document with same content_hash
-                    deleted_doc = self._check_deleted_duplicate(validation_result.normalized_data['content_hash'])
-                    if deleted_doc:
-                        self.logger.info(f"🔄 Found deleted document with same content, reactivating: {deleted_doc['title']}")
-                        # Reactivate the deleted document with updated data
-                        success = self._reactivate_document(deleted_doc['id'], validation_result.normalized_data)
-                        if success:
-                            self.logger.info(f"✅ Successfully reactivated document {deleted_doc['id']}")
-                            return True, f"Document reactivated: {deleted_doc['title']}", deleted_doc['id']
-                        else:
-                            self.logger.error(f"❌ Failed to reactivate document {deleted_doc['id']}")
-                            return False, f"Failed to reactivate existing document", None
+                    # Check specific constraint type and handle accordingly
+                    if "documents.url" in error_msg:
+                        self.logger.info("🔍 URL constraint violation detected")
+                        # Check for deleted document with same URL
+                        deleted_doc = self._check_deleted_url_duplicate(validation_result.normalized_data['url'])
+                        if deleted_doc:
+                            self.logger.info(f"🔄 Found deleted document with same URL, reactivating: {deleted_doc['title']}")
+                            success = self._reactivate_document(deleted_doc['id'], validation_result.normalized_data)
+                            if success:
+                                self.logger.info(f"✅ Successfully reactivated document {deleted_doc['id']}")
+                                return True, f"Document reactivated: {deleted_doc['title']}", deleted_doc['id']
+                        
+                        # Handle race condition - document was inserted between check and insert
+                        existing_doc = self._check_url_duplicate(validation_result.normalized_data['url'])
+                        if existing_doc:
+                            self.logger.info(f"Document already exists by URL (race condition): {existing_doc['title']}")
+                            return True, f"Document already exists: {existing_doc['title']}", existing_doc['id']
                     
-                    # Handle race condition - document was inserted between check and insert
-                    existing_doc = self._check_duplicate(validation_result.normalized_data['content_hash'])
-                    if existing_doc:
-                        self.logger.info(f"Document already exists (race condition): {existing_doc['title']}")
-                        return True, f"Document already exists: {existing_doc['title']}", existing_doc['id']
+                    elif "documents.content_hash" in error_msg or "content_hash" in error_msg:
+                        self.logger.info("🔍 Content hash constraint violation detected")
+                        # Check if there's a deleted document with same content_hash
+                        deleted_doc = self._check_deleted_duplicate(validation_result.normalized_data['content_hash'])
+                        if deleted_doc:
+                            self.logger.info(f"🔄 Found deleted document with same content, reactivating: {deleted_doc['title']}")
+                            success = self._reactivate_document(deleted_doc['id'], validation_result.normalized_data)
+                            if success:
+                                self.logger.info(f"✅ Successfully reactivated document {deleted_doc['id']}")
+                                return True, f"Document reactivated: {deleted_doc['title']}", deleted_doc['id']
+                        
+                        # Handle race condition - document was inserted between check and insert
+                        existing_doc = self._check_duplicate(validation_result.normalized_data['content_hash'])
+                        if existing_doc:
+                            self.logger.info(f"Document already exists by content (race condition): {existing_doc['title']}")
+                            return True, f"Document already exists: {existing_doc['title']}", existing_doc['id']
+                    
+                    else:
+                        # Generic constraint violation - check both types
+                        self.logger.info("🔍 Generic constraint violation - checking both URL and content hash")
+                        
+                        # Check for deleted documents by both criteria
+                        deleted_by_content = self._check_deleted_duplicate(validation_result.normalized_data['content_hash'])
+                        deleted_by_url = self._check_deleted_url_duplicate(validation_result.normalized_data['url'])
+                        
+                        target_doc = deleted_by_content or deleted_by_url
+                        if target_doc:
+                            self.logger.info(f"🔄 Found deleted document, reactivating: {target_doc['title']}")
+                            success = self._reactivate_document(target_doc['id'], validation_result.normalized_data)
+                            if success:
+                                self.logger.info(f"✅ Successfully reactivated document {target_doc['id']}")
+                                return True, f"Document reactivated: {target_doc['title']}", target_doc['id']
+                        
+                        # Check for active documents by both criteria
+                        existing_by_content = self._check_duplicate(validation_result.normalized_data['content_hash'])
+                        existing_by_url = self._check_url_duplicate(validation_result.normalized_data['url'])
+                        
+                        existing_doc = existing_by_content or existing_by_url
+                        if existing_doc:
+                            self.logger.info(f"Document already exists (race condition): {existing_doc['title']}")
+                            return True, f"Document already exists: {existing_doc['title']}", existing_doc['id']
                     
                     # If no deleted or active document found, this is an unexpected constraint violation
                     self.logger.error(f"❌ Unexpected UNIQUE constraint violation: {error_msg}")
@@ -118,6 +166,7 @@ class StorageManager:
             # Check if this is a constraint error that wasn't handled
             if any(phrase in error_msg for phrase in [
                 "UNIQUE constraint failed: documents.content_hash",
+                "UNIQUE constraint failed: documents.url",
                 "UNIQUE constraint failed",
                 "constraint failed"
             ]):
@@ -134,10 +183,22 @@ class StorageManager:
         results = db.execute_query(query, (content_hash,))
         return results[0] if results else None
     
+    def _check_url_duplicate(self, url: str) -> Optional[Dict]:
+        """Check if document with same URL exists"""
+        query = "SELECT * FROM documents WHERE url = ? AND status = 'active'"
+        results = db.execute_query(query, (url,))
+        return results[0] if results else None
+    
     def _check_deleted_duplicate(self, content_hash: str) -> Optional[Dict]:
         """Check if a deleted document with same content hash exists"""
         query = "SELECT * FROM documents WHERE content_hash = ? AND status = 'deleted'"
         results = db.execute_query(query, (content_hash,))
+        return results[0] if results else None
+    
+    def _check_deleted_url_duplicate(self, url: str) -> Optional[Dict]:
+        """Check if a deleted document with same URL exists"""
+        query = "SELECT * FROM documents WHERE url = ? AND status = 'deleted'"
+        results = db.execute_query(query, (url,))
         return results[0] if results else None
     
     def _reactivate_document(self, doc_id: int, updated_data: Dict) -> bool:

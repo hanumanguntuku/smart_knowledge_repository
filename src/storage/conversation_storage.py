@@ -70,16 +70,86 @@ class ConversationStorageManager:
             
             # Create new thread if none found
             thread_id = self.create_conversation_thread(session_id)
-            return thread_id if thread_id else 1  # Fallback
+            if thread_id:
+                return thread_id
+            
+            # If creation failed, try to use any existing thread for this session
+            fallback_query = """
+            SELECT id FROM conversation_threads 
+            WHERE session_id = ? 
+            ORDER BY updated_at DESC LIMIT 1
+            """
+            fallback_result = self.db.execute_query(fallback_query, (session_id,))
+            
+            if fallback_result and len(fallback_result) > 0:
+                thread_id = fallback_result[0]['id']
+                self.logger.warning(f"⚠️ Using fallback thread {thread_id} for session {session_id}")
+                return thread_id
+            
+            # Last resort: create a basic thread with minimal requirements
+            self.logger.warning(f"⚠️ Creating emergency thread for session {session_id}")
+            try:
+                basic_query = """
+                INSERT INTO conversation_threads (session_id, title, created_at, updated_at)
+                VALUES (?, ?, datetime('now'), datetime('now'))
+                """
+                self.db.execute_query(basic_query, (session_id, f"Emergency Thread"))
+                thread_id = self.db.get_last_insert_id()
+                if thread_id:
+                    self.logger.info(f"✅ Created emergency thread {thread_id}")
+                    return thread_id
+            except Exception as emergency_error:
+                self.logger.error(f"❌ Emergency thread creation failed: {emergency_error}")
+            
+            # Absolute fallback - return 1 and ensure it exists
+            return self._ensure_default_thread()
             
         except Exception as e:
             self.logger.error(f"❌ Error getting active thread: {e}")
-            return 1  # Fallback to thread 1
+            return self._ensure_default_thread()
+    
+    def _ensure_default_thread(self) -> int:
+        """Ensure there's always a default thread available"""
+        try:
+            # Check if thread 1 exists
+            check_query = "SELECT id FROM conversation_threads WHERE id = 1"
+            result = self.db.execute_query(check_query)
+            
+            if result and len(result) > 0:
+                return 1
+            
+            # Create default thread
+            create_query = """
+            INSERT OR REPLACE INTO conversation_threads (id, session_id, title, created_at, updated_at)
+            VALUES (1, 'default', 'Default Thread', datetime('now'), datetime('now'))
+            """
+            self.db.execute_query(create_query)
+            self.logger.info("✅ Created default thread (ID: 1)")
+            return 1
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error ensuring default thread: {e}")
+            return 1  # Return 1 regardless - better than None
     
     def save_message(self, thread_id: int, role: str, content: str, 
                     sources: List[Dict] = None, metadata: Dict = None) -> bool:
         """Save a message to the conversation thread"""
         try:
+            # Validate thread_id
+            if thread_id is None:
+                self.logger.error("❌ Cannot save message: thread_id is None")
+                return False
+            
+            if not isinstance(thread_id, int) or thread_id <= 0:
+                self.logger.error(f"❌ Invalid thread_id: {thread_id} (type: {type(thread_id)})")
+                return False
+            
+            # Verify thread exists
+            thread_check = self.db.execute_query("SELECT id FROM conversation_threads WHERE id = ?", (thread_id,))
+            if not thread_check:
+                self.logger.error(f"❌ Thread {thread_id} does not exist")
+                return False
+            
             sources_json = json.dumps(sources if sources else [])
             metadata_json = json.dumps(metadata if metadata else {})
             
@@ -95,9 +165,13 @@ class ConversationStorageManager:
                 self._update_thread_stats(thread_id)
                 self.logger.info(f"💬 Saved {role} message to thread {thread_id}")
                 return True
+            else:
+                self.logger.error(f"❌ Failed to save message: database returned None")
+                return False
                 
         except Exception as e:
-            self.logger.error(f"❌ Error saving message: {e}")
+            self.logger.error(f"❌ Error saving message to thread {thread_id}: {e}")
+            return False
         
         return False
     

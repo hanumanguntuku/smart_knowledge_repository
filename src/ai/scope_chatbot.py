@@ -228,7 +228,14 @@ class ScopeAwareChatbot:
             self.conversation_storage = ConversationStorageManager()
             self.conversation_enabled = True
             self.current_thread_id = self.conversation_storage.get_or_create_active_thread(self.session_id)
-            logger.info(f"✅ Conversation management enabled for session {self.session_id}")
+            
+            # Ensure thread_id is never None
+            if self.current_thread_id is None:
+                logger.error("❌ Failed to get thread_id, disabling conversation management")
+                self.conversation_enabled = False
+                self.current_thread_id = None
+            else:
+                logger.info(f"✅ Conversation management enabled for session {self.session_id} with thread {self.current_thread_id}")
         else:
             self.context_manager = None
             self.conversation_storage = None
@@ -277,7 +284,7 @@ class ScopeAwareChatbot:
         """Process user query with enhanced analysis and response generation"""
         try:
             # Enhanced conversation context analysis if available
-            if self.conversation_enabled and self.context_manager:
+            if self.conversation_enabled and self.context_manager and self.current_thread_id:
                 context_analysis = self.context_manager.analyze_query_context(
                     query, self.current_thread_id, self.session_id
                 )
@@ -286,10 +293,14 @@ class ScopeAwareChatbot:
                 enhanced_query = context_analysis.get('resolved_query', query)
                 
                 # Save user message to conversation
-                self.conversation_storage.save_message(
-                    self.current_thread_id, 'user', query, 
-                    metadata={'context_analysis': context_analysis}
-                )
+                if self.conversation_storage and self.current_thread_id:
+                    try:
+                        self.conversation_storage.save_message(
+                            self.current_thread_id, 'user', query, 
+                            metadata={'context_analysis': context_analysis}
+                        )
+                    except Exception as save_error:
+                        logger.error(f"❌ Error saving user message: {save_error}")
             else:
                 enhanced_query = query
                 context_analysis = {'context_needed': False, 'is_follow_up': False}
@@ -311,16 +322,19 @@ class ScopeAwareChatbot:
                 response = self._handle_in_scope_query_enhanced(enhanced_query, scope_result, query_analysis, user_context)
             
             # Save assistant response to conversation if available
-            if self.conversation_enabled and self.conversation_storage:
-                self.conversation_storage.save_message(
-                    self.current_thread_id, 'assistant', response.get('response', ''),
-                    sources=response.get('sources', []),
-                    metadata={
-                        'confidence': response.get('confidence', 0),
-                        'citations': response.get('citations', []),
-                        'context_analysis': context_analysis
-                    }
-                )
+            if self.conversation_enabled and self.conversation_storage and self.current_thread_id:
+                try:
+                    self.conversation_storage.save_message(
+                        self.current_thread_id, 'assistant', response.get('response', ''),
+                        sources=response.get('sources', []),
+                        metadata={
+                            'confidence': response.get('confidence', 0),
+                            'citations': response.get('citations', []),
+                            'context_analysis': context_analysis
+                        }
+                    )
+                except Exception as save_error:
+                    logger.error(f"❌ Error saving assistant message: {save_error}")
             
             # Add assistant response to context
             self._add_to_conversation_context('assistant', response.get('response', ''), {
