@@ -21,6 +21,12 @@ try:
 except ImportError:
     OPENAI_AVAILABLE = False
 
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+
 from ..core.config import config
 from ..core.database import DatabaseManager
 from .chroma_client import chroma_client
@@ -38,36 +44,137 @@ class EmbeddingGenerator:
         self._initialize_embedding_model()
     
     def _initialize_embedding_model(self):
-        """Initialize the embedding model based on configuration"""
+        """Initialize embedding model with OpenAI primary and Gemini fallback"""
         try:
-            # Prefer SentenceTransformers over OpenAI for embeddings (more reliable and free)
-            if SENTENCE_TRANSFORMERS_AVAILABLE:
+            # Strategy 1: Use OpenAI embeddings (primary)
+            if config.use_openai_embeddings and OPENAI_AVAILABLE and config.openai_api_key:
+                self.logger.info("🔄 Attempting to use OpenAI embeddings...")
+                self._setup_openai_embeddings()
+                
+            # Strategy 2: Use Gemini as AI fallback
+            elif config.use_gemini_fallback and GEMINI_AVAILABLE and config.gemini_api_key:
+                self.logger.info("🔄 Using Gemini embeddings as primary...")
+                self._setup_gemini_embeddings()
+                
+            # Strategy 3: Local embeddings as last resort
+            elif SENTENCE_TRANSFORMERS_AVAILABLE:
                 self.model = SentenceTransformer(config.embedding_model)
                 self.embedding_type = "sentence_transformer"
-                self.logger.info(f"Using SentenceTransformer: {config.embedding_model}")
-            elif config.use_openai and OPENAI_AVAILABLE and config.openai_api_key:
-                openai.api_key = config.openai_api_key
-                self.embedding_type = "openai"
-                self.logger.info("Using OpenAI embeddings")
+                self.logger.warning("⚠️ Using local embeddings - AI providers not available")
+                
             else:
-                self.logger.warning("No embedding model available. Semantic search disabled.")
+                self.logger.error("❌ No embedding provider available")
                 self.embedding_type = None
+                
         except Exception as e:
             self.logger.error(f"Failed to initialize embedding model: {e}")
+            # Force fallback to Gemini if initialization fails
+            if GEMINI_AVAILABLE and config.gemini_api_key:
+                self.logger.info("🔄 Forcing fallback to Gemini due to initialization failure...")
+                self._setup_gemini_embeddings()
+            elif SENTENCE_TRANSFORMERS_AVAILABLE:
+                self.model = SentenceTransformer(config.embedding_model)
+                self.embedding_type = "sentence_transformer"
+                self.logger.info("↩️ Final fallback to local embeddings")
+            else:
+                self.embedding_type = None
+    
+    def _setup_openai_embeddings(self):
+        """Setup OpenAI embeddings with quota-aware fallback"""
+        try:
+            openai.api_key = config.openai_api_key
+            self.embedding_type = "openai"
+            self.logger.info("✅ Using OpenAI embeddings (primary)")
+            
+            # Test with a simple embedding to detect quota issues
+            self._test_openai_embeddings()
+            
+        except Exception as e:
+            error_msg = str(e)
+            if "quota" in error_msg.lower() or "insufficient_quota" in error_msg:
+                self.logger.warning(f"⚠️ OpenAI quota exceeded, falling back to Gemini")
+                self._fallback_to_gemini()
+            elif "rate_limit" in error_msg.lower():
+                self.logger.warning(f"⚠️ OpenAI rate limit reached, falling back to Gemini")
+                self._fallback_to_gemini()
+            else:
+                self.logger.error(f"❌ OpenAI embeddings setup failed: {e}")
+                self._fallback_to_gemini()
+    
+    def _setup_gemini_embeddings(self):
+        """Setup Google Gemini embeddings"""
+        try:
+            if not GEMINI_AVAILABLE:
+                raise ImportError("google-generativeai not installed")
+                
+            genai.configure(api_key=config.gemini_api_key)
+            self.embedding_type = "gemini"
+            self.logger.info("✅ Using Google Gemini embeddings")
+            
+        except Exception as e:
+            self.logger.error(f"❌ Gemini embeddings setup failed: {e}")
+            self._fallback_to_local()
+    
+    def _test_openai_embeddings(self):
+        """Test OpenAI embeddings to detect quota issues early"""
+        try:
+            # Try a minimal test embedding
+            import openai
+            client = openai.OpenAI(api_key=config.openai_api_key)
+            client.embeddings.create(
+                model="text-embedding-ada-002",
+                input="test"
+            )
+            self.openai_client = client
+            
+        except Exception as e:
+            if "quota" in str(e).lower():
+                raise e  # Re-raise quota errors
+            else:
+                self.logger.warning(f"OpenAI test failed: {e}")
+    
+    def _fallback_to_gemini(self):
+        """Fallback to Gemini when OpenAI fails"""
+        if config.use_gemini_fallback and GEMINI_AVAILABLE and config.gemini_api_key:
+            self._setup_gemini_embeddings()
+        else:
+            self._fallback_to_local()
+    
+    def _fallback_to_local(self):
+        """Final fallback to local embeddings"""
+        if SENTENCE_TRANSFORMERS_AVAILABLE:
+            self.model = SentenceTransformer(config.embedding_model)
+            self.embedding_type = "sentence_transformer"
+            self.logger.info("↩️ Falling back to local embeddings")
+        else:
+            self.logger.error("❌ No embedding provider available")
             self.embedding_type = None
     
-    def generate_embeddings_for_document(self, document_id: int, content: str, title: str = "", domain: str = "general") -> bool:
+    def _generate_gemini_embedding_fallback(self, text: str) -> Optional[np.ndarray]:
+        """Generate embedding using Gemini as fallback when OpenAI fails"""
+        try:
+            if GEMINI_AVAILABLE and config.gemini_api_key:
+                import google.generativeai as genai
+                genai.configure(api_key=config.gemini_api_key)
+                result = genai.embed_content(
+                    model="models/embedding-001",
+                    content=text
+                )
+                return np.array(result['embedding'])
+            else:
+                self.logger.error("❌ Gemini not available for fallback")
+                return None
+        except Exception as e:
+            self.logger.error(f"❌ Gemini embedding fallback failed: {e}")
+            return None
+    
+    def generate_embeddings_for_document(self, document_id: int, content: str, title: str = "") -> bool:
         """Generate and store embeddings for a document using ChromaDB"""
         if not self.embedding_type:
             self.logger.warning("No embedding model available")
             return False
         
         try:
-            # Get document metadata for domain classification
-            doc_metadata = self._get_document_metadata(document_id)
-            if doc_metadata:
-                domain = self._classify_domain(content, title, doc_metadata.get('domain', 'general'))
-            
             # Split content into chunks
             chunks = self._split_into_chunks(content, title)
             
@@ -83,12 +190,11 @@ class EmbeddingGenerator:
                 success = self.chroma.add_embeddings(
                     document_id=document_id,
                     chunks=chunks,
-                    embeddings=embeddings,
-                    domain=domain
+                    embeddings=embeddings
                 )
                 
                 if success:
-                    self.logger.info(f"Generated {len(chunks)} embeddings for document {document_id} in domain '{domain}'")
+                    self.logger.info(f"Generated {len(chunks)} embeddings for document {document_id}")
                     return True
                 else:
                     self.logger.error(f"Failed to store embeddings in ChromaDB for document {document_id}")
@@ -112,35 +218,6 @@ class EmbeddingGenerator:
         except Exception as e:
             self.logger.error(f"Failed to get document metadata: {e}")
             return None
-    
-    def _classify_domain(self, content: str, title: str, current_domain: str = "general") -> str:
-        """Classify document domain based on content"""
-        # Use existing domain if already classified
-        if current_domain and current_domain != "general":
-            return current_domain.lower()
-        
-        # Simple keyword-based domain classification
-        text_to_analyze = f"{title} {content}".lower()
-        
-        domain_keywords = {
-            'technology': ['ai', 'artificial intelligence', 'machine learning', 'software', 'programming', 'computer', 'technology', 'algorithm', 'data science'],
-            'business': ['business', 'strategy', 'management', 'finance', 'marketing', 'sales', 'company', 'revenue', 'profit'],
-            'science': ['research', 'study', 'experiment', 'analysis', 'scientific', 'hypothesis', 'methodology', 'results'],
-            'healthcare': ['health', 'medical', 'medicine', 'treatment', 'patient', 'diagnosis', 'therapy', 'clinical'],
-            'education': ['education', 'learning', 'teaching', 'student', 'course', 'training', 'academic', 'curriculum']
-        }
-        
-        # Count keyword matches for each domain
-        domain_scores = {}
-        for domain, keywords in domain_keywords.items():
-            score = sum(1 for keyword in keywords if keyword in text_to_analyze)
-            if score > 0:
-                domain_scores[domain] = score
-        
-        # Return domain with highest score, or general if no clear match
-        if domain_scores:
-            return max(domain_scores, key=domain_scores.get)
-        return "general"
     
     def _split_into_chunks(self, content: str, title: str = "") -> List[Dict]:
         chunks = []
@@ -195,11 +272,64 @@ class EmbeddingGenerator:
                 )
                 return np.array(response.data[0].embedding)
             
+            elif self.embedding_type == "gemini":
+                # Use Google Gemini embeddings
+                import google.generativeai as genai
+                genai.configure(api_key=config.gemini_api_key)
+                result = genai.embed_content(
+                    model="models/embedding-001",
+                    content=text
+                )
+                return np.array(result['embedding'])
+            
             elif self.embedding_type == "sentence_transformer":
                 return self.model.encode(text, convert_to_numpy=True)
             
         except Exception as e:
+            error_msg = str(e).lower()
             self.logger.error(f"Failed to generate embedding: {e}")
+            
+            # Enhanced quota and error handling with fallback
+            if self.embedding_type == "openai" and any(keyword in error_msg for keyword in ["quota", "exceeded", "limit", "insufficient_quota"]):
+                self.logger.warning("⚠️ OpenAI quota exceeded during embedding, falling back to Gemini")
+                return self._generate_gemini_embedding_fallback(text)
+            elif self.embedding_type == "openai" and any(keyword in error_msg for keyword in ["rate_limit", "rate limit", "too many requests"]):
+                self.logger.warning("⚠️ OpenAI rate limit reached during embedding, falling back to Gemini")
+                return self._generate_gemini_embedding_fallback(text)
+            elif self.embedding_type == "gemini" and any(keyword in error_msg for keyword in ["quota", "exceeded", "limit", "resource_exhausted"]):
+                self.logger.warning("⚠️ Gemini quota exceeded during embedding, falling back to sentence transformer")
+                return self._generate_sentence_transformer_fallback(text)
+            
+            return None
+    
+    def _generate_gemini_embedding_fallback(self, text: str) -> Optional[np.ndarray]:
+        """Generate embedding using Gemini as fallback when OpenAI fails"""
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=config.gemini_api_key)
+            result = genai.embed_content(
+                model="models/embedding-001",
+                content=text
+            )
+            self.logger.info("✅ Successfully generated embedding using Gemini fallback")
+            return np.array(result['embedding'])
+        except Exception as e:
+            self.logger.error(f"❌ Gemini embedding fallback also failed: {e}")
+            return self._generate_sentence_transformer_fallback(text)
+    
+    def _generate_sentence_transformer_fallback(self, text: str) -> Optional[np.ndarray]:
+        """Generate embedding using sentence transformer as final fallback"""
+        try:
+            if not hasattr(self, 'fallback_model'):
+                from sentence_transformers import SentenceTransformer
+                self.fallback_model = SentenceTransformer('all-MiniLM-L6-v2')
+                self.logger.info("Initialized sentence transformer fallback model")
+            
+            embedding = self.fallback_model.encode(text, convert_to_numpy=True)
+            self.logger.info("✅ Successfully generated embedding using sentence transformer fallback")
+            return embedding
+        except Exception as e:
+            self.logger.error(f"❌ All embedding methods failed: {e}")
             return None
     
     def _store_embedding(self, document_id: int, chunk_id: int, chunk: Dict, embedding: np.ndarray):
@@ -220,7 +350,7 @@ class EmbeddingGenerator:
             pickle.dumps({'type': chunk['type'], 'length': len(chunk['text'])})
         ))
     
-    def search_similar_chunks(self, query: str, domain: str = None, limit: int = 10, threshold: float = None) -> List[Dict]:
+    def search_similar_chunks(self, query: str, limit: int = 10, threshold: float = None) -> List[Dict]:
         """Search for similar chunks using ChromaDB"""
         if not self.embedding_type:
             self.logger.warning("No embedding model available for search")
@@ -239,7 +369,6 @@ class EmbeddingGenerator:
             # ChromaDB search
             results = self.chroma.search_similar(
                 query_embedding=query_embedding.tolist(),
-                domain=domain,
                 limit=limit
             )
             
@@ -286,7 +415,6 @@ class EmbeddingGenerator:
             # Check if document already has embeddings in ChromaDB
             existing = self.chroma.search_similar(
                 query_embedding=[0.0] * 384,  # Dummy embedding to check existence
-                domain=doc.get('domain', 'general'),
                 limit=1,
                 where_filter={'document_id': doc['id']}
             )
@@ -324,23 +452,3 @@ class EmbeddingGenerator:
             stats['status'] = 'chromadb_unavailable'
         
         return stats
-    
-    def _generate_embedding(self, text: str) -> Optional[np.ndarray]:
-        """Generate embedding for a text chunk"""
-        try:
-            if self.embedding_type == "openai":
-                # Use new OpenAI client API (v1.0+)
-                import openai
-                client = openai.OpenAI(api_key=config.openai_api_key)
-                response = client.embeddings.create(
-                    model="text-embedding-ada-002",
-                    input=text
-                )
-                return np.array(response.data[0].embedding)
-            
-            elif self.embedding_type == "sentence_transformer":
-                return self.model.encode(text, convert_to_numpy=True)
-            
-        except Exception as e:
-            self.logger.error(f"Failed to generate embedding: {e}")
-            return None

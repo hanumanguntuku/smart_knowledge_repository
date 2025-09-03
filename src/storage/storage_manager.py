@@ -4,7 +4,7 @@ Storage management module for documents and metadata with ChromaDB integration
 import json
 import logging
 from typing import List, Dict, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 from ..core.database import db
 from ..processors.data_validator import DataValidator
 from ..search.embedding_engine import EmbeddingGenerator
@@ -18,11 +18,14 @@ class StorageManager:
         self.validator = DataValidator()
         self.embedding_generator = EmbeddingGenerator()
     
-    def store_document(self, document_data: Dict) -> Tuple[bool, str, Optional[int]]:
+    def store_document(self, document_data: Dict, skip_url_validation: bool = False) -> Tuple[bool, str, Optional[int]]:
         """Store a document in the database"""
         try:
-            # Validate document
-            validation_result = self.validator.validate_document(document_data)
+            # Validate document with optional URL validation skip
+            if skip_url_validation:
+                validation_result = self._validate_document_relaxed(document_data)
+            else:
+                validation_result = self.validator.validate_document(document_data)
             
             if not validation_result.is_valid:
                 error_msg = f"Validation failed: {'; '.join(validation_result.errors)}"
@@ -32,31 +35,155 @@ class StorageManager:
             # Check for duplicates
             existing_doc = self._check_duplicate(validation_result.normalized_data['content_hash'])
             if existing_doc:
-                self.logger.info(f"Duplicate document found: {existing_doc['url']}")
-                return False, f"Document already exists: {existing_doc['title']}", existing_doc['id']
+                self.logger.info(f"Duplicate document found: {existing_doc['title']} (ID: {existing_doc['id']})")
+                return True, f"Document already exists: {existing_doc['title']}", existing_doc['id']
             
-            # Insert document
-            doc_id = self._insert_document(validation_result.normalized_data)
+            # Insert document with duplicate handling
+            try:
+                doc_id = self._insert_document(validation_result.normalized_data)
+            except Exception as db_error:
+                error_msg = str(db_error)
+                self.logger.info(f"🔍 Database operation error: {error_msg}")
+                
+                # More comprehensive constraint error detection
+                if any(phrase in error_msg for phrase in [
+                    "UNIQUE constraint failed: documents.content_hash",
+                    "UNIQUE constraint failed",
+                    "constraint failed",
+                    "integrity error"
+                ]):
+                    self.logger.info(f"🔍 UNIQUE constraint violation detected: {error_msg}")
+                    
+                    # Check if there's a deleted document with same content_hash
+                    deleted_doc = self._check_deleted_duplicate(validation_result.normalized_data['content_hash'])
+                    if deleted_doc:
+                        self.logger.info(f"🔄 Found deleted document with same content, reactivating: {deleted_doc['title']}")
+                        # Reactivate the deleted document with updated data
+                        success = self._reactivate_document(deleted_doc['id'], validation_result.normalized_data)
+                        if success:
+                            self.logger.info(f"✅ Successfully reactivated document {deleted_doc['id']}")
+                            return True, f"Document reactivated: {deleted_doc['title']}", deleted_doc['id']
+                        else:
+                            self.logger.error(f"❌ Failed to reactivate document {deleted_doc['id']}")
+                            return False, f"Failed to reactivate existing document", None
+                    
+                    # Handle race condition - document was inserted between check and insert
+                    existing_doc = self._check_duplicate(validation_result.normalized_data['content_hash'])
+                    if existing_doc:
+                        self.logger.info(f"Document already exists (race condition): {existing_doc['title']}")
+                        return True, f"Document already exists: {existing_doc['title']}", existing_doc['id']
+                    
+                    # If no deleted or active document found, this is an unexpected constraint violation
+                    self.logger.error(f"❌ Unexpected UNIQUE constraint violation: {error_msg}")
+                    self.logger.error(f"❌ Content hash causing issue: {validation_result.normalized_data['content_hash']}")
+                    
+                    # Try to force reactivation by searching more broadly
+                    self.logger.info("🔍 Searching for any document with same content hash...")
+                    try:
+                        from ..core.database import db
+                        all_docs_query = "SELECT * FROM documents WHERE content_hash = ?"
+                        all_docs = db.execute_query(all_docs_query, (validation_result.normalized_data['content_hash'],))
+                        if all_docs:
+                            self.logger.info(f"Found {len(all_docs)} documents with same hash:")
+                            for doc in all_docs:
+                                self.logger.info(f"  ID {doc['id']}: '{doc['title']}' (status: {doc['status']})")
+                            
+                            # Try to reactivate the first deleted one found
+                            deleted_docs = [doc for doc in all_docs if doc['status'] == 'deleted']
+                            if deleted_docs:
+                                target_doc = deleted_docs[0]
+                                self.logger.info(f"🔄 Attempting to reactivate document {target_doc['id']}")
+                                success = self._reactivate_document(target_doc['id'], validation_result.normalized_data)
+                                if success:
+                                    return True, f"Document reactivated: {target_doc['title']}", target_doc['id']
+                    except Exception as search_error:
+                        self.logger.error(f"Error during broad search: {search_error}")
+                    
+                    return False, f"Database constraint error: {error_msg}", None
+                
+                # Re-raise if it's a different database error
+                self.logger.error(f"❌ Non-constraint database error: {error_msg}")
+                raise db_error
             
-            # Auto-categorize
-            domain = self._auto_categorize_document(doc_id, validation_result.normalized_data)
-            
-            # Generate embeddings automatically
-            self._generate_embeddings_async(doc_id, validation_result.normalized_data, domain)
+            # Generate embeddings automatically  
+            self._generate_embeddings_async(doc_id, validation_result.normalized_data)
             
             self.logger.info(f"Stored document {doc_id}: {validation_result.normalized_data['title']}")
             return True, "Document stored successfully", doc_id
             
         except Exception as e:
-            error_msg = f"Error storing document: {str(e)}"
-            self.logger.error(error_msg)
-            return False, error_msg, None
+            error_msg = str(e)
+            self.logger.error(f"❌ Outer exception handler caught: {error_msg}")
+            
+            # Check if this is a constraint error that wasn't handled
+            if any(phrase in error_msg for phrase in [
+                "UNIQUE constraint failed: documents.content_hash",
+                "UNIQUE constraint failed",
+                "constraint failed"
+            ]):
+                self.logger.error("🚨 CONSTRAINT ERROR IN OUTER HANDLER - This should have been caught earlier!")
+                self.logger.error(f"Content hash: {validation_result.normalized_data.get('content_hash', 'Unknown') if 'validation_result' in locals() else 'Validation not completed'}")
+                return False, f"Database constraint error: {error_msg}", None
+            
+            # For other errors, return the original error message
+            return False, f"Error storing document: {error_msg}", None
     
     def _check_duplicate(self, content_hash: str) -> Optional[Dict]:
         """Check if document with same content hash exists"""
         query = "SELECT * FROM documents WHERE content_hash = ? AND status = 'active'"
         results = db.execute_query(query, (content_hash,))
         return results[0] if results else None
+    
+    def _check_deleted_duplicate(self, content_hash: str) -> Optional[Dict]:
+        """Check if a deleted document with same content hash exists"""
+        query = "SELECT * FROM documents WHERE content_hash = ? AND status = 'deleted'"
+        results = db.execute_query(query, (content_hash,))
+        return results[0] if results else None
+    
+    def _reactivate_document(self, doc_id: int, updated_data: Dict) -> bool:
+        """Reactivate a deleted document with updated data"""
+        try:
+            # Ensure metadata is properly formatted
+            if 'metadata' in updated_data and isinstance(updated_data['metadata'], dict):
+                metadata_json = json.dumps(updated_data.get('metadata', {}))
+            elif 'metadata' in updated_data and isinstance(updated_data['metadata'], str):
+                metadata_json = updated_data['metadata']  # Already JSON string
+            else:
+                metadata_json = json.dumps({})
+                
+            query = """
+                UPDATE documents 
+                SET url = ?, title = ?, content = ?, content_type = ?, domain = ?,
+                    language = ?, word_count = ?, char_count = ?, reading_time_minutes = ?,
+                    metadata = ?, status = 'active', updated_at = ?
+                WHERE id = ?
+            """
+            params = (
+                updated_data['url'], updated_data['title'], updated_data['content'], 
+                updated_data['content_type'], updated_data['domain'], updated_data['language'],
+                updated_data['word_count'], updated_data['char_count'], updated_data['reading_time_minutes'],
+                metadata_json, datetime.now().isoformat(), doc_id
+            )
+            
+            self.logger.debug(f"Reactivating document {doc_id} with params: {[type(p).__name__ for p in params]}")
+            rows_affected = db.execute_update(query, params)
+            
+            if rows_affected > 0:
+                # Regenerate embeddings for reactivated document
+                self._generate_embeddings_async(doc_id, updated_data)
+                self.logger.info(f"✅ Successfully reactivated document {doc_id}")
+                return True
+            else:
+                self.logger.error(f"❌ No rows affected when reactivating document {doc_id}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"❌ Error reactivating document {doc_id}: {e}")
+            # Log parameter types for debugging
+            if 'params' in locals():
+                param_types = [f"{i}: {type(p).__name__}" for i, p in enumerate(params)]
+                self.logger.error(f"Parameter types: {param_types}")
+            return False
     
     def _insert_document(self, data: Dict) -> int:
         """Insert document into database"""
@@ -88,163 +215,58 @@ class StorageManager:
         
         return db.execute_insert(query, params)
     
-    def _auto_categorize_document(self, doc_id: int, data: Dict) -> str:
-        """Automatically categorize document based on content and return domain"""
-        content = data['content'].lower()
-        title = data['title'].lower()
-        text_to_analyze = f"{title} {content}"
-        
-        # Simple keyword-based categorization
-        category_keywords = {
-            'Technology': ['ai', 'artificial intelligence', 'machine learning', 'software', 'programming', 'computer', 'technology'],
-            'Business': ['business', 'strategy', 'management', 'finance', 'marketing', 'sales', 'company'],
-            'Science': ['research', 'study', 'experiment', 'analysis', 'scientific', 'data', 'hypothesis'],
-            'Healthcare': ['health', 'medical', 'medicine', 'treatment', 'patient', 'diagnosis', 'therapy'],
-            'Education': ['education', 'learning', 'teaching', 'student', 'course', 'training', 'academic']
-        }
-        
-        # Calculate scores for each category
-        category_scores = {}
-        for category, keywords in category_keywords.items():
-            score = sum(1 for keyword in keywords if keyword in text_to_analyze)
-            if score > 0:
-                category_scores[category] = score / len(keywords)
-        
-        assigned_category = "General"  # Default category
-        domain = "general"  # Default domain for ChromaDB
-        
-        # Assign to best matching category
-        if category_scores:
-            best_category = max(category_scores, key=category_scores.get)
-            confidence = category_scores[best_category]
-            assigned_category = best_category
-            domain = best_category.lower()
-            
-            # Get category ID
-            category_query = "SELECT id FROM categories WHERE name = ?"
-            category_result = db.execute_query(category_query, (best_category,))
-            
-            if category_result:
-                category_id = category_result[0]['id']
-                
-                # Insert category relationship
-                rel_query = """
-                    INSERT INTO document_categories (document_id, category_id, confidence, assigned_by)
-                    VALUES (?, ?, ?, 'auto')
-                """
-                db.execute_insert(rel_query, (doc_id, category_id, confidence))
-        else:
-            # Assign to 'General' category
-            category_query = "SELECT id FROM categories WHERE name = 'General'"
-            category_result = db.execute_query(category_query)
-            
-            if category_result:
-                category_id = category_result[0]['id']
-                rel_query = """
-                    INSERT INTO document_categories (document_id, category_id, confidence, assigned_by)
-                    VALUES (?, ?, ?, 'auto')
-                """
-                db.execute_insert(rel_query, (doc_id, category_id, 0.5))
-        
-        self.logger.debug(f"Categorized document {doc_id} as '{assigned_category}' (domain: {domain})")
-        return domain
-    
-    def _generate_embeddings_async(self, doc_id: int, data: Dict, domain: str):
+    def _generate_embeddings_async(self, doc_id: int, data: Dict):
         """Generate embeddings for the document asynchronously"""
         try:
             # Generate embeddings in background
             self.embedding_generator.generate_embeddings_for_document(
                 document_id=doc_id,
                 content=data['content'],
-                title=data['title'],
-                domain=domain
+                title=data['title']
             )
             self.logger.debug(f"Initiated embedding generation for document {doc_id}")
         except Exception as e:
             self.logger.error(f"Failed to generate embeddings for document {doc_id}: {e}")
             # Don't fail the entire storage operation if embeddings fail
     
-    def get_documents(self, category: str = None, status: str = 'active', 
-                     limit: int = 100, offset: int = 0) -> List[Dict]:
+    def get_documents(self, status: str = 'active', 
+                     limit: int = 500, offset: int = 0) -> List[Dict]:
         """Retrieve documents with optional filtering"""
-        if category and category != 'All':
-            query = """
-                SELECT d.*, c.name as category_name, dc.confidence
-                FROM documents d
-                JOIN document_categories dc ON d.id = dc.document_id
-                JOIN categories c ON dc.category_id = c.id
-                WHERE d.status = ? AND c.name = ?
-                ORDER BY d.created_at DESC
-                LIMIT ? OFFSET ?
-            """
-            params = (status, category, limit, offset)
-        else:
-            query = """
-                SELECT d.*, 
-                       (SELECT GROUP_CONCAT(c.name) 
-                        FROM document_categories dc 
-                        JOIN categories c ON dc.category_id = c.id 
-                        WHERE dc.document_id = d.id) as categories
-                FROM documents d
-                WHERE d.status = ?
-                ORDER BY d.created_at DESC
-                LIMIT ? OFFSET ?
-            """
-            params = (status, limit, offset)
+        query = """
+            SELECT d.*
+            FROM documents d
+            WHERE d.status = ?
+            ORDER BY d.created_at DESC
+            LIMIT ? OFFSET ?
+        """
+        params = (status, limit, offset)
         
         return db.execute_query(query, params)
     
-    def search_documents(self, query: str, category: str = None, limit: int = 10) -> List[Dict]:
+    def search_documents(self, query: str, limit: int = 50) -> List[Dict]:
         """Basic keyword search in documents"""
         search_term = f"%{query}%"
         
-        if category and category != 'All':
-            sql_query = """
-                SELECT d.*, c.name as category_name,
-                       (CASE 
-                        WHEN d.title LIKE ? THEN 3
-                        WHEN d.content LIKE ? THEN 1
-                        ELSE 0 
-                       END) as relevance_score
-                FROM documents d
-                JOIN document_categories dc ON d.id = dc.document_id
-                JOIN categories c ON dc.category_id = c.id
-                WHERE (d.title LIKE ? OR d.content LIKE ?) 
-                AND c.name = ? AND d.status = 'active'
-                ORDER BY relevance_score DESC, d.created_at DESC
-                LIMIT ?
-            """
-            params = (search_term, search_term, search_term, search_term, category, limit)
-        else:
-            sql_query = """
-                SELECT d.*,
-                       (CASE 
-                        WHEN d.title LIKE ? THEN 3
-                        WHEN d.content LIKE ? THEN 1
-                        ELSE 0 
-                       END) as relevance_score,
-                       (SELECT GROUP_CONCAT(c.name) 
-                        FROM document_categories dc 
-                        JOIN categories c ON dc.category_id = c.id 
-                        WHERE dc.document_id = d.id) as categories
-                FROM documents d
-                WHERE (d.title LIKE ? OR d.content LIKE ?) 
-                AND d.status = 'active'
-                ORDER BY relevance_score DESC, d.created_at DESC
-                LIMIT ?
-            """
-            params = (search_term, search_term, search_term, search_term, limit)
+        sql_query = """
+            SELECT d.*
+            FROM documents d
+            WHERE d.status = 'active' 
+            AND (d.title LIKE ? OR d.content LIKE ?)
+            ORDER BY d.created_at DESC
+            LIMIT ?
+        """
+        params = (search_term, search_term, limit)
         
         return db.execute_query(sql_query, params)
+    
+    def get_categories(self) -> List[Dict]:
+        """Get all categories with document counts (deprecated - returns empty list)"""
+        return []
     
     def get_document_by_id(self, doc_id: int) -> Optional[Dict]:
         """Get specific document by ID"""
         query = """
-            SELECT d.*,
-                   (SELECT GROUP_CONCAT(c.name) 
-                    FROM document_categories dc 
-                    JOIN categories c ON dc.category_id = c.id 
-                    WHERE dc.document_id = d.id) as categories
+            SELECT d.*
             FROM documents d
             WHERE d.id = ?
         """
@@ -292,10 +314,26 @@ class StorageManager:
                 query = "UPDATE documents SET status = 'deleted', updated_at = ? WHERE id = ?"
                 params = (datetime.now().isoformat(), doc_id)
                 rows_affected = db.execute_update(query, params)
+                
+                # Also remove from ChromaDB to free up vector storage
+                if hasattr(self, 'chroma_client') and self.chroma_client:
+                    try:
+                        self.chroma_client.delete_document_embeddings(doc_id)
+                    except Exception as chroma_error:
+                        self.logger.warning(f"⚠️ Failed to remove embeddings from ChromaDB: {chroma_error}")
+                        
             else:
                 # Hard delete - remove all related data
                 db.execute_update("DELETE FROM embeddings WHERE document_id = ?", (doc_id,))
                 db.execute_update("DELETE FROM document_categories WHERE document_id = ?", (doc_id,))
+                
+                # Remove from ChromaDB
+                if hasattr(self, 'chroma_client') and self.chroma_client:
+                    try:
+                        self.chroma_client.delete_document_embeddings(doc_id)
+                    except Exception as chroma_error:
+                        self.logger.warning(f"⚠️ Failed to remove embeddings from ChromaDB: {chroma_error}")
+                
                 rows_affected = db.execute_update("DELETE FROM documents WHERE id = ?", (doc_id,))
             
             return rows_affected > 0
@@ -303,6 +341,27 @@ class StorageManager:
         except Exception as e:
             self.logger.error(f"Error deleting document {doc_id}: {e}")
             return False
+    
+    def cleanup_old_deleted_documents(self, days_old: int = 30) -> int:
+        """Permanently delete documents that have been soft-deleted for more than specified days"""
+        try:
+            cutoff_date = (datetime.now() - timedelta(days=days_old)).isoformat()
+            
+            # Get old deleted documents
+            query = "SELECT id FROM documents WHERE status = 'deleted' AND updated_at < ?"
+            old_deleted = db.execute_query(query, (cutoff_date,))
+            
+            count = 0
+            for doc in old_deleted:
+                if self.delete_document(doc['id'], soft_delete=False):
+                    count += 1
+                    
+            self.logger.info(f"✅ Cleaned up {count} old deleted documents")
+            return count
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error cleaning up old deleted documents: {e}")
+            return 0
     
     def get_categories(self) -> List[Dict]:
         """Get all categories"""
@@ -338,9 +397,23 @@ class StorageManager:
         """)
         stats['documents'] = {row['status']: row['count'] for row in doc_stats}
         
-        # Category counts
-        cat_stats = db.execute_query("SELECT COUNT(*) as count FROM categories")
-        stats['categories'] = cat_stats[0]['count'] if cat_stats else 0
+        # Content statistics
+        content_stats = db.execute_query("""
+            SELECT 
+                SUM(word_count) as total_words,
+                SUM(char_count) as total_characters,
+                AVG(word_count) as avg_words_per_doc,
+                COUNT(DISTINCT domain) as unique_domains
+            FROM documents 
+            WHERE status = 'active'
+        """)
+        if content_stats and content_stats[0]:
+            stats.update({
+                'total_words': content_stats[0]['total_words'] or 0,
+                'total_characters': content_stats[0]['total_characters'] or 0,
+                'avg_words_per_doc': round(content_stats[0]['avg_words_per_doc'] or 0, 1),
+                'unique_domains': content_stats[0]['unique_domains'] or 0
+            })
         
         # Recent activity
         recent_docs = db.execute_query("""
@@ -351,3 +424,71 @@ class StorageManager:
         stats['recent_documents'] = recent_docs[0]['count'] if recent_docs else 0
         
         return stats
+
+    def _validate_document_relaxed(self, document_data: Dict):
+        """Relaxed validation for manual entries and file uploads"""
+        from ..processors.data_validator import ValidationResult
+        
+        errors = []
+        warnings = []
+        normalized_data = document_data.copy()
+        
+        # Title validation (required)
+        title = document_data.get('title', '').strip()
+        if not title:
+            errors.append("Title is required")
+        elif len(title) < 3:
+            errors.append("Title must be at least 3 characters")
+        else:
+            normalized_data['title'] = title[:200]  # Limit length
+        
+        # Content validation (relaxed minimum)
+        content = document_data.get('content', '').strip()
+        if not content:
+            errors.append("Content is required")
+        elif len(content) < 10:  # Much more relaxed than 50
+            errors.append("Content must be at least 10 characters")
+        else:
+            normalized_data['content'] = content
+        
+        # URL handling (relaxed - can be any format)
+        url = document_data.get('url', '').strip()
+        if not url:
+            # Generate a placeholder URL for manual entries
+            url = f"manual://document_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        normalized_data['url'] = url
+        
+        # Generate required fields
+        import hashlib
+        normalized_data['content_hash'] = hashlib.md5(
+            normalized_data['content'].encode('utf-8')
+        ).hexdigest()
+        
+        normalized_data['content_type'] = document_data.get('content_type', 'text/plain')
+        normalized_data['domain'] = 'general'
+        normalized_data['language'] = 'en'
+        
+        # Content metrics
+        words = normalized_data['content'].split()
+        normalized_data['word_count'] = len(words)
+        normalized_data['char_count'] = len(normalized_data['content'])
+        normalized_data['reading_time_minutes'] = max(1, len(words) // 200)
+        
+        # Metadata
+        metadata = document_data.get('metadata', {})
+        metadata['validation_type'] = 'relaxed'
+        normalized_data['metadata'] = metadata
+        normalized_data['scrape_metadata'] = '{}'
+        
+        # Timestamps
+        now = datetime.now().isoformat()
+        normalized_data['created_at'] = now
+        normalized_data['updated_at'] = now
+        normalized_data['status'] = 'active'
+        
+        return ValidationResult(
+            is_valid=len(errors) == 0,
+            errors=errors,
+            warnings=warnings,
+            normalized_data=normalized_data if len(errors) == 0 else None
+        )

@@ -27,11 +27,15 @@ class ValidationResult:
 class DataValidator:
     """Data validator for document processing"""
     
-    def __init__(self):
+    def __init__(self, min_content_length: int = 50):
         self.logger = logging.getLogger(__name__)
-        self.min_content_length = 50
+        self.min_content_length = min_content_length
         self.max_content_length = 1000000  # 1MB
         self.supported_languages = ['en', 'es', 'fr', 'de', 'it', 'pt']
+    
+    def set_min_content_length(self, length: int):
+        """Set minimum content length for validation"""
+        self.min_content_length = max(1, length)  # Ensure at least 1 character
     
     def validate_document(self, data: Dict) -> ValidationResult:
         """Comprehensive document validation"""

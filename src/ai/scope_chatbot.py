@@ -19,6 +19,12 @@ except ImportError:
     OPENAI_AVAILABLE = False
 
 try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+
+try:
     from transformers import AutoTokenizer, AutoModelForCausalLM
     import torch
     TRANSFORMERS_AVAILABLE = True
@@ -205,12 +211,28 @@ class ScopeAwareChatbot:
         self.llm_client = self._initialize_llm()
         
     def _initialize_llm(self):
-        """Initialize LLM client based on configuration"""
+        """Initialize LLM client with OpenAI primary and Gemini fallback"""
+        # Try OpenAI first
         if config.use_openai and OPENAI_AVAILABLE and config.openai_api_key:
-            # Initialize OpenAI client for v1.0+
-            import openai
-            self.openai_client = openai.OpenAI(api_key=config.openai_api_key)
-            return "openai"
+            try:
+                import openai
+                self.openai_client = openai.OpenAI(api_key=config.openai_api_key)
+                logger.info("✅ OpenAI LLM client initialized")
+                return "openai"
+            except Exception as e:
+                logger.warning(f"⚠️ OpenAI initialization failed: {e}")
+                
+        # Fallback to Gemini
+        if config.use_gemini_fallback and GEMINI_AVAILABLE and config.gemini_api_key:
+            try:
+                genai.configure(api_key=config.gemini_api_key)
+                self.gemini_model = genai.GenerativeModel(config.gemini_model)
+                logger.info("✅ Gemini LLM client initialized as fallback")
+                return "gemini"
+            except Exception as e:
+                logger.warning(f"⚠️ Gemini initialization failed: {e}")
+                
+        # Local transformer fallback
         elif TRANSFORMERS_AVAILABLE:
             try:
                 self.tokenizer = AutoTokenizer.from_pretrained(config.local_llm_model)
@@ -259,10 +281,8 @@ class ScopeAwareChatbot:
         
         # Use SEMANTIC SEARCH instead of keyword search for scope analysis
         # This allows finding relevant documents based on meaning, not just exact text matches
-        category = domain.title() if domain != 'general' else None
         relevant_docs = self.search_engine.search(
             query=optimized_query,
-            category=category,
             max_results=5,
             search_type="semantic"  # Use pure semantic search for better relevance
         )
@@ -299,14 +319,12 @@ class ScopeAwareChatbot:
                                       query_analysis: Dict, user_context: Dict) -> Dict:
         """Enhanced in-scope query handling with better search and citations"""
         # Perform enhanced search using hybrid approach
-        category = scope_result['domain'].title() if scope_result['domain'] != 'general' else None
         
         # Try different search strategies based on intent
         search_strategy = self._determine_search_strategy(query_analysis['intent'])
         
         search_results = self.search_engine.search(
             query=scope_result['optimized_query'],
-            category=category,
             max_results=8,  # Get more results for better context
             search_type=search_strategy
         )
@@ -384,6 +402,10 @@ class ScopeAwareChatbot:
         # Generate response using LLM with enhanced prompts
         if self.llm_client == "openai":
             response = self._generate_openai_response_enhanced(
+                query, context_data, scope_result, query_analysis
+            )
+        elif self.llm_client == "gemini":
+            response = self._generate_gemini_response(
                 query, context_data, scope_result, query_analysis
             )
         elif self.llm_client == "local":
@@ -548,8 +570,20 @@ Please provide a comprehensive answer based on the context provided, including p
             return response.choices[0].message.content
             
         except Exception as e:
-            logger.error(f"OpenAI response generation failed: {e}")
-            return self._generate_enhanced_fallback_response(query, context_data, scope_result, query_analysis)
+            # Handle specific OpenAI errors gracefully
+            error_msg = str(e).lower()
+            if any(keyword in error_msg for keyword in ["insufficient_quota", "quota", "exceeded", "limit"]):
+                logger.warning(f"⚠️ OpenAI quota exceeded, falling back to Gemini")
+                return self._generate_gemini_response(query, context_data, scope_result, query_analysis)
+            elif any(keyword in error_msg for keyword in ["rate_limit", "rate limit", "too many requests"]):
+                logger.warning(f"⚠️ OpenAI rate limit reached, falling back to Gemini")
+                return self._generate_gemini_response(query, context_data, scope_result, query_analysis)
+            elif "api_key" in error_msg or "authentication" in error_msg:
+                logger.warning(f"⚠️ OpenAI authentication issue, falling back to Gemini")
+                return self._generate_gemini_response(query, context_data, scope_result, query_analysis)
+            else:
+                logger.error(f"❌ OpenAI response generation failed: {e}")
+                return self._generate_gemini_response(query, context_data, scope_result, query_analysis)
     
     def _generate_local_llm_response_enhanced(self, query: str, context_data: Dict,
                                             scope_result: Dict, query_analysis: Dict) -> str:
@@ -622,6 +656,71 @@ Please provide a comprehensive answer based on the context provided, including p
             response_parts.append("\n\n⚠️ Note: Search results have moderate relevance. Consider refining your question.")
         
         return ''.join(response_parts)
+    
+    def _generate_gemini_response(self, query: str, context_data: Dict,
+                                scope_result: Dict, query_analysis: Dict) -> str:
+        """Generate response using Google Gemini when OpenAI fails"""
+        try:
+            if not hasattr(self, 'gemini_model'):
+                # Initialize Gemini if not already done
+                if GEMINI_AVAILABLE and config.gemini_api_key:
+                    genai.configure(api_key=config.gemini_api_key)
+                    self.gemini_model = genai.GenerativeModel(config.gemini_model)
+                else:
+                    return self._generate_enhanced_fallback_response(query, context_data, scope_result, query_analysis)
+            
+            # Build context from search results
+            context_text = ""
+            if context_data['citations']:
+                context_text = "\n\n".join([
+                    f"Document: {c['title']}\nContent: {c['excerpt']}\nSource: {c['url']}"
+                    for c in context_data['citations'][:3]  # Top 3 results
+                ])
+            
+            # Create prompt for Gemini
+            system_instruction = f"""You are an AI assistant with access to a knowledge base. 
+            Answer the user's question based on the provided context. Be accurate, helpful, and cite sources.
+            
+            Query Intent: {query_analysis['intent']}
+            Query Domain: {query_analysis['domain']}
+            Scope: {scope_result['scope']}"""
+            
+            user_prompt = f"""Question: {query}
+            
+            Context from knowledge base:
+            {context_text}
+            
+            Please provide a comprehensive answer based on the context provided, including proper citations."""
+            
+            # Generate response using Gemini
+            full_prompt = f"{system_instruction}\n\n{user_prompt}"
+            response = self.gemini_model.generate_content(full_prompt)
+            
+            logger.info("✅ Generated response using Gemini (OpenAI fallback)")
+            return response.text
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            
+            # Handle specific Gemini quota/rate limit errors with detailed detection
+            if any(keyword in error_msg for keyword in ["quota", "exceeded", "limit", "resource_exhausted", "insufficient_quota"]):
+                logger.error(f"❌ Gemini quota/rate limit exceeded: {e}")
+                return self._generate_enhanced_fallback_response(query, context_data, scope_result, query_analysis)
+            elif any(keyword in error_msg for keyword in ["safety", "blocked", "content_filter", "harmful"]):
+                logger.warning(f"⚠️ Gemini content safety filter triggered: {e}")
+                return "I apologize, but I cannot provide a response to this query due to content safety policies. Please rephrase your question."
+            elif any(keyword in error_msg for keyword in ["api_key", "authentication", "unauthorized", "permission"]):
+                logger.error(f"❌ Gemini authentication issue: {e}")
+                return self._generate_enhanced_fallback_response(query, context_data, scope_result, query_analysis)
+            elif any(keyword in error_msg for keyword in ["invalid_argument", "bad_request", "malformed"]):
+                logger.error(f"❌ Gemini invalid request: {e}")
+                return self._generate_enhanced_fallback_response(query, context_data, scope_result, query_analysis)
+            elif any(keyword in error_msg for keyword in ["timeout", "deadline", "timed_out"]):
+                logger.warning(f"⚠️ Gemini request timeout: {e}")
+                return "I apologize, but the request timed out. Please try again with a shorter question."
+            else:
+                logger.error(f"❌ Gemini response generation failed with unexpected error: {e}")
+                return self._generate_enhanced_fallback_response(query, context_data, scope_result, query_analysis)
     
     def _get_intent_guidance(self, intent: str) -> str:
         """Get response guidance based on query intent"""
@@ -743,7 +842,7 @@ Please provide a comprehensive answer based on the context provided, including p
         
         # Check if we have relevant documents in this domain
         relevant_docs = self.storage_manager.search_documents(
-            query, category=domain.title() if domain != 'general' else None, limit=5
+            query, limit=5
         )
         
         if confidence > 0.7 and relevant_docs:
@@ -766,10 +865,8 @@ Please provide a comprehensive answer based on the context provided, including p
                               user_context: Dict) -> Dict:
         """Handle queries within knowledge scope"""
         # Perform search
-        category = scope_result['domain'].title() if scope_result['domain'] != 'general' else None
         search_results = self.search_engine.search(
             query=query,
-            category=category,
             max_results=5
         )
         

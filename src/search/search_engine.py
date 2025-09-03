@@ -16,7 +16,7 @@ class SearchEngine:
         self.embedding_generator = EmbeddingGenerator()
         self.logger = logging.getLogger(__name__)
     
-    def search(self, query: str, category: str = None, max_results: int = 10, 
+    def search(self, query: str, max_results: int = 10, 
                search_type: str = "hybrid") -> List[Dict]:
         """Perform hybrid search combining full-text and semantic search"""
         if not query or not query.strip():
@@ -30,13 +30,13 @@ class SearchEngine:
         if search_type in ["hybrid", "fulltext"]:
             # Perform full-text search
             fulltext_results = self.storage_manager.search_documents(
-                clean_query, category=category, limit=max_results * 2
+                clean_query, limit=max_results * 2
             )
             results.extend(self._add_search_type(fulltext_results, "fulltext"))
         
         if search_type in ["hybrid", "semantic"]:
             # Perform semantic search
-            semantic_results = self._semantic_search(query, category, max_results)
+            semantic_results = self._semantic_search(query, max_results)
             results.extend(self._add_search_type(semantic_results, "semantic"))
         
         # Combine and rank results
@@ -60,16 +60,12 @@ class SearchEngine:
         
         return unique_results[:max_results]
     
-    def _semantic_search(self, query: str, category: str = None, limit: int = 10) -> List[Dict]:
-        """Perform semantic search using ChromaDB embeddings with domain filtering"""
+    def _semantic_search(self, query: str, limit: int = 10) -> List[Dict]:
+        """Perform semantic search using ChromaDB embeddings"""
         try:
-            # Map category to domain for ChromaDB search
-            domain = self._map_category_to_domain(category) if category else None
-            
-            # Get similar chunks with domain filtering
+            # Get similar chunks
             similar_chunks = self.embedding_generator.search_similar_chunks(
                 query=query,
-                domain=domain,
                 limit=limit * 3  # Get more chunks to group by document
             )
             
@@ -82,7 +78,6 @@ class SearchEngine:
                         'id': doc_id,
                         'title': chunk.get('title', 'Unknown Document'),
                         'url': chunk.get('url', ''),
-                        'domain': chunk.get('domain', 'general'),
                         'content': '',
                         'semantic_score': 0,
                         'best_chunk': chunk['chunk_text'],
@@ -118,22 +113,6 @@ class SearchEngine:
             self.logger.error(f"Semantic search failed: {e}")
             return []
     
-    def _map_category_to_domain(self, category: str) -> str:
-        """Map category names to ChromaDB domain names"""
-        if not category:
-            return None
-            
-        category_mapping = {
-            'Technology': 'technology',
-            'Business': 'business', 
-            'Science': 'science',
-            'Healthcare': 'healthcare',
-            'Education': 'education',
-            'General': 'general'
-        }
-        
-        return category_mapping.get(category, category.lower())
-    
     def _combine_hybrid_results(self, results: List[Dict], query: str) -> List[Dict]:
         """Combine and score results from both full-text and semantic search"""
         # Group results by document ID
@@ -149,7 +128,6 @@ class SearchEngine:
                     'title': result.get('title', ''),
                     'content': result.get('content', ''),
                     'url': result.get('url', ''),
-                    'domain': result.get('domain', ''),
                     'fulltext_score': 0,
                     'semantic_score': 0,
                     'search_types': set()
@@ -280,9 +258,9 @@ class SearchEngine:
         if len(title) > 10 and not title.isupper():
             score += 0.1
         
-        # Domain credibility
-        domain = document.get('domain', '')
-        if any(ext in domain for ext in ['.edu', '.gov', '.org']):
+        # Domain credibility (extract domain from URL)
+        url = document.get('url', '')
+        if any(ext in url for ext in ['.edu', '.gov', '.org']):
             score += 0.1
         
         return min(score, 1.0)

@@ -23,6 +23,14 @@ except ImportError:
 # Add parent directory to path to allow imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+# Import pagination manager
+try:
+    from src.core.pagination_config import pagination_manager
+    PAGINATION_AVAILABLE = True
+except ImportError:
+    PAGINATION_AVAILABLE = False
+    pagination_manager = None
+
 from src.core.database import DatabaseManager
 from src.storage.storage_manager import StorageManager
 from src.search.search_engine import SearchEngine
@@ -115,7 +123,7 @@ def main():
         with col1:
             st.metric("Documents", stats.get('documents', {}).get('active', 0))
         with col2:
-            st.metric("Categories", stats.get('categories', 0))
+            st.metric("Total Words", stats.get('total_words', 0))
     
     # Route to appropriate page
     if page == "🔍 Search":
@@ -147,30 +155,47 @@ def search_page():
         )
     
     with col2:
-        max_results = st.number_input("Max Results", min_value=1, max_value=50, value=10)
+        max_results = st.number_input("Max Results", min_value=1, max_value=200, value=20)
     
     # Advanced search options
     with st.expander("🎯 Advanced Options"):
         col1, col2 = st.columns(2)
         
         with col1:
-            categories = st.session_state.storage_manager.get_categories()
-            category_names = ['All'] + [cat['name'] for cat in categories]
-            selected_category = st.selectbox("Category:", category_names)
+            search_type = st.selectbox("Search Type:", ["Keyword", "Phrase", "Fuzzy"])
         
         with col2:
-            search_type = st.selectbox("Search Type:", ["Keyword", "Phrase", "Fuzzy"])
+            include_content = st.checkbox("Include content preview", value=True)
     
     # Perform search
     if st.button("🔍 Search", type="primary") or query:
         if query:
+            # Validate page size with warnings
+            import time
+            
+            if PAGINATION_AVAILABLE:
+                validated_size, warnings = pagination_manager.validate_page_size(max_results, "search")
+            else:
+                validated_size, warnings = max_results, []
+            
+            # Show warnings if any
+            for warning in warnings:
+                st.warning(warning)
+            
+            # Show progressive loading info if needed
+            if PAGINATION_AVAILABLE and pagination_manager.should_use_progressive_loading(validated_size):
+                st.info(f"💡 Loading {validated_size} results progressively for better performance...")
+            
             with st.spinner("Searching knowledge base..."):
-                category = None if selected_category == 'All' else selected_category
+                start_time = time.time()
                 results = st.session_state.search_engine.search(
                     query=query,
-                    category=category,
-                    max_results=max_results
+                    max_results=validated_size
                 )
+                
+                # Monitor performance
+                if PAGINATION_AVAILABLE:
+                    pagination_manager.monitor_performance("search", start_time, len(results))
                 
                 display_search_results(results, query)
 
@@ -192,8 +217,7 @@ def display_search_results(results: list, query: str):
     with col2:
         st.metric("Avg. Relevance", f"{avg_score:.2f}")
     with col3:
-        unique_categories = len(set(r.get('categories', 'Unknown') for r in results))
-        st.metric("Categories", unique_categories)
+        st.metric("Avg. Relevance", f"{avg_score:.2f}")
     
     # Display results
     for i, result in enumerate(results):
@@ -208,7 +232,6 @@ def display_search_results(results: list, query: str):
                 
                 # Document metadata
                 st.markdown(f"**URL:** {result.get('url', 'N/A')}")
-                st.markdown(f"**Categories:** {result.get('categories', 'Uncategorized')}")
                 st.markdown(f"**Word Count:** {result.get('word_count', 'N/A')}")
                 st.markdown(f"**Created:** {result.get('created_at', 'N/A')}")
                 
@@ -237,26 +260,46 @@ def browse_documents_page():
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        categories = st.session_state.storage_manager.get_categories()
-        category_names = ['All'] + [cat['name'] for cat in categories]
-        filter_category = st.selectbox("Filter by Category:", category_names)
-    
-    with col2:
         sort_options = ["Recent", "Title A-Z", "Title Z-A", "Word Count"]
         sort_by = st.selectbox("Sort by:", sort_options)
     
+    with col2:
+        items_per_page = st.selectbox("Items per page:", [10, 25, 50, 100, 200, 500])
+    
     with col3:
-        items_per_page = st.selectbox("Items per page:", [10, 25, 50, 100])
+        search_filter = st.text_input("Filter by title/content:", placeholder="Enter keywords...")
     
     # Search within documents
     search_filter = st.text_input("🔍 Search documents:", placeholder="Filter by title or content...")
     
     # Get documents
-    category = None if filter_category == 'All' else filter_category
+    import time
+    
+    # Validate page size
+    if PAGINATION_AVAILABLE:
+        validated_size, warnings = pagination_manager.validate_page_size(items_per_page, "browse")
+    else:
+        validated_size, warnings = items_per_page, []
+    
+    # Show warnings if any
+    for warning in warnings:
+        st.warning(warning)
+    
+    # Show performance info for large requests
+    if PAGINATION_AVAILABLE and pagination_manager.should_use_progressive_loading(validated_size):
+        with st.expander("ℹ️ Performance Info"):
+            st.info(f"Loading {validated_size} documents. This may take a moment...")
+            batch_size = pagination_manager.get_batch_size(validated_size)
+            st.write(f"Using batch size: {batch_size} for optimal performance")
+    
+    start_time = time.time()
     documents = st.session_state.storage_manager.get_documents(
-        category=category,
-        limit=items_per_page
+        limit=validated_size
     )
+    
+    # Monitor performance
+    if PAGINATION_AVAILABLE:
+        pagination_manager.monitor_performance("browse_documents", start_time, len(documents))
     
     # Apply search filter
     if search_filter:
@@ -279,7 +322,7 @@ def browse_documents_page():
                     st.markdown(f"**📄 {doc.get('title', 'Untitled')}**")
                     preview = doc.get('content', '')[:100] + "..." if len(doc.get('content', '')) > 100 else doc.get('content', '')
                     st.caption(preview)
-                    st.caption(f"Category: {doc.get('categories', 'Uncategorized')} | Words: {doc.get('word_count', 'N/A')}")
+                    st.caption(f"Words: {doc.get('word_count', 'N/A')} | Created: {doc.get('created_at', 'N/A')}")
                 
                 with col2:
                     if st.button("👁️ View", key=f"view_{doc['id']}"):
@@ -382,35 +425,178 @@ def data_management_page():
     with tab1:
         st.subheader("📤 Add Documents")
         
-        # Manual document entry
-        with st.form("add_document"):
-            title = st.text_input("Document Title:")
-            url = st.text_input("URL:")
-            content = st.text_area("Content:", height=200)
-            
-            # Category selection
-            categories = st.session_state.storage_manager.get_categories()
-            category_names = [cat['name'] for cat in categories]
-            selected_category = st.selectbox("Category:", category_names)
-            
-            submitted = st.form_submit_button("Add Document")
-            
-            if submitted and title and content and url:
-                # Prepare document data
-                doc_data = {
-                    'title': title,
-                    'url': url,
-                    'content': content,
-                    'metadata': {'manual_entry': True}
-                }
+        # Document input method selection
+        input_method = st.radio(
+            "Choose input method:",
+            ["📝 Manual Entry", "📁 Upload File", "🔗 Load from URL"],
+            horizontal=True
+        )
+        
+        if input_method == "📝 Manual Entry":
+            # Manual document entry
+            with st.form("add_document_manual"):
+                title = st.text_input("Document Title:")
+                url = st.text_input("Source URL (optional):", 
+                                   placeholder="https://example.com (leave empty if not applicable)")
+                content = st.text_area("Content:", height=200, 
+                                     placeholder="Enter or paste your document content here...")
                 
-                # Store document
-                success, message, doc_id = st.session_state.storage_manager.store_document(doc_data)
+                submitted = st.form_submit_button("Add Document")
                 
-                if success:
-                    st.success(f"Document added successfully! ID: {doc_id}")
-                else:
-                    st.error(f"Error adding document: {message}")
+                if submitted and title and content:
+                    # Prepare document data
+                    doc_data = {
+                        'title': title,
+                        'url': url if url.strip() else f"manual://document_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                        'content': content,
+                        'metadata': {
+                            'manual_entry': True,
+                            'input_method': 'manual'
+                        }
+                    }
+                    
+                    # Store document with relaxed validation
+                    success, message, doc_id = st.session_state.storage_manager.store_document(doc_data, skip_url_validation=True)
+                    
+                    if success:
+                        st.success(f"✅ Document added successfully! ID: {doc_id}")
+                    else:
+                        st.error(f"❌ Error adding document: {message}")
+        
+        elif input_method == "📁 Upload File":
+            # File upload
+            with st.form("add_document_file"):
+                uploaded_file = st.file_uploader(
+                    "Choose a file",
+                    type=['txt', 'md', 'pdf', 'docx', 'csv'],
+                    help="Supported formats: TXT, Markdown, PDF, Word, CSV"
+                )
+                
+                title = st.text_input("Document Title (optional):", 
+                                    placeholder="Leave empty to use filename")
+                
+                submitted = st.form_submit_button("Upload and Process")
+                
+                if submitted and uploaded_file:
+                    try:
+                        # Read file content
+                        file_content = ""
+                        file_name = uploaded_file.name
+                        
+                        if file_name.endswith('.txt') or file_name.endswith('.md'):
+                            file_content = str(uploaded_file.read(), "utf-8")
+                        elif file_name.endswith('.csv'):
+                            import pandas as pd
+                            df = pd.read_csv(uploaded_file)
+                            file_content = df.to_string()
+                        else:
+                            st.warning("⚠️ Unsupported file type. Please use TXT, MD, or CSV files for now.")
+                            file_content = None
+                        
+                        if file_content:
+                            # Use filename as title if not provided
+                            doc_title = title if title.strip() else file_name.rsplit('.', 1)[0]
+                            
+                            # Prepare document data
+                            doc_data = {
+                                'title': doc_title,
+                                'url': f"file://uploaded/{file_name}",
+                                'content': file_content,
+                                'metadata': {
+                                    'manual_entry': True,
+                                    'input_method': 'file_upload',
+                                    'original_filename': file_name,
+                                    'file_size': len(file_content)
+                                }
+                            }
+                            
+                            # Store document with relaxed validation
+                            success, message, doc_id = st.session_state.storage_manager.store_document(doc_data, skip_url_validation=True)
+                            
+                            if success:
+                                st.success(f"✅ File uploaded successfully! ID: {doc_id}")
+                                st.info(f"📄 Processed {len(file_content)} characters from {file_name}")
+                            else:
+                                st.error(f"❌ Error uploading file: {message}")
+                    
+                    except Exception as e:
+                        st.error(f"❌ Error processing file: {str(e)}")
+        
+        elif input_method == "🔗 Load from URL":
+            # URL loading with content extraction
+            with st.form("add_document_url"):
+                source_url = st.text_input("URL to load:", 
+                                         placeholder="https://example.com/article")
+                title = st.text_input("Document Title (optional):", 
+                                    placeholder="Leave empty to extract from webpage")
+                
+                # Advanced options
+                with st.expander("⚙️ Advanced Options"):
+                    extract_links = st.checkbox("Extract and store links", value=False)
+                    min_content_length = st.slider("Minimum content length", 10, 200, 30)
+                
+                submitted = st.form_submit_button("Load from URL")
+                
+                if submitted and source_url:
+                    with st.spinner("🔍 Loading content from URL..."):
+                        try:
+                            # Use web scraper to get single page
+                            scraped_docs = st.session_state.web_scraper.scrape_website_sync(
+                                start_url=source_url,
+                                max_depth=0,  # Only scrape the single page
+                                max_pages=1
+                            )
+                            
+                            if scraped_docs and len(scraped_docs) > 0:
+                                doc = scraped_docs[0]
+                                
+                                # Check content length with custom threshold
+                                if len(doc.content.strip()) < min_content_length:
+                                    st.warning(f"⚠️ Content too short ({len(doc.content)} characters). Minimum: {min_content_length}")
+                                    st.info("💡 Try lowering the minimum content length or check if the URL is accessible.")
+                                else:
+                                    # Use provided title or extracted title
+                                    doc_title = title.strip() if title.strip() else doc.title
+                                    
+                                    # Prepare document data
+                                    doc_data = {
+                                        'title': doc_title,
+                                        'url': source_url,
+                                        'content': doc.content,
+                                        'metadata': {
+                                            **doc.metadata,
+                                            'input_method': 'url_load',
+                                            'extracted_title': doc.title,
+                                            'content_length': len(doc.content),
+                                            'links_found': len(doc.links) if extract_links else 0
+                                        }
+                                    }
+                                    
+                                    # Store document
+                                    success, message, doc_id = st.session_state.storage_manager.store_document(doc_data)
+                                    
+                                    if success:
+                                        st.success(f"✅ Content loaded successfully! ID: {doc_id}")
+                                        
+                                        # Show preview
+                                        with st.expander("📄 Content Preview"):
+                                            st.write(f"**Title:** {doc_title}")
+                                            st.write(f"**Content Length:** {len(doc.content)} characters")
+                                            st.write(f"**Content Preview:**")
+                                            st.write(doc.content[:500] + "..." if len(doc.content) > 500 else doc.content)
+                                    else:
+                                        st.error(f"❌ Error storing document: {message}")
+                            else:
+                                st.warning("⚠️ No content could be extracted from the URL.")
+                                st.info("This might be due to:")
+                                st.write("• URL not accessible")
+                                st.write("• Content requires JavaScript")
+                                st.write("• Site blocking automated requests")
+                                st.write("• Invalid URL format")
+                        
+                        except Exception as e:
+                            st.error(f"❌ Error loading from URL: {str(e)}")
+                            st.info("💡 Try using the manual entry method instead.")
     
     with tab2:
         st.subheader("🌐 Web Scraping")
@@ -419,11 +605,6 @@ def data_management_page():
             scrape_url = st.text_input("URL to scrape:")
             max_depth = st.slider("Maximum depth:", 1, 5, 2)
             max_pages = st.slider("Maximum pages:", 1, 100, 10)
-            
-            # Category selection for scraped content
-            categories = st.session_state.storage_manager.get_categories()
-            category_names = [cat['name'] for cat in categories] if categories else ["General"]
-            selected_category = st.selectbox("Category for scraped content:", category_names)
             
             start_scraping = st.form_submit_button("Start Scraping")
             
@@ -615,19 +796,19 @@ def analytics_page():
             st.line_chart(growth_data.set_index('Date'))
     
     with col2:
-        st.subheader("🎯 Category Distribution")
-        categories = st.session_state.storage_manager.get_categories()
+        st.subheader("📊 Content Statistics")
+        stats = st.session_state.storage_manager.get_statistics()
         
-        if categories:
-            cat_data = pd.DataFrame(categories)
-            if PLOTLY_AVAILABLE and px is not None:
-                fig = px.pie(cat_data, values='document_count', names='name', 
-                            title="Documents by Category")
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.bar_chart(cat_data.set_index('name')['document_count'])
-        else:
-            st.info("No category data available yet.")
+        # Display content metrics
+        content_stats = {
+            'Total Words': stats.get('total_words', 0),
+            'Total Characters': stats.get('total_characters', 0),
+            'Avg. Words per Doc': stats.get('avg_words_per_doc', 0),
+            'Unique Domains': stats.get('unique_domains', 0)
+        }
+        
+        for metric, value in content_stats.items():
+            st.metric(metric, value)
 
 
 def settings_page():
@@ -673,6 +854,48 @@ def settings_page():
         with col3:
             st.metric("Active Sessions", "1")
             st.metric("Error Rate", "0%")
+    
+    # Performance monitoring
+    with st.expander("⚡ Performance Monitoring"):
+        if PAGINATION_AVAILABLE:
+            st.subheader("Pagination Performance")
+            
+            # Current configuration
+            st.write("**Current Limits:**")
+            limits = pagination_manager.limits
+            st.json({
+                "Search Results Max": limits.search_results_max,
+                "Browse Documents Max": limits.browse_documents_max,
+                "API Default Limit": limits.api_default_limit,
+                "Performance Warning Threshold (ms)": limits.performance_warning_threshold,
+                "Memory Warning Threshold (MB)": limits.memory_warning_threshold_mb
+            })
+            
+            # Performance summary
+            performance_summary = pagination_manager.get_performance_summary()
+            if performance_summary:
+                st.write("**Recent Performance:**")
+                for operation, metrics in performance_summary.items():
+                    with st.container():
+                        st.write(f"**{operation.replace('_', ' ').title()}:**")
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Avg Time", f"{metrics['avg_time']:.2f}s")
+                        with col2:
+                            st.metric("Max Time", f"{metrics['max_time']:.2f}s")
+                        with col3:
+                            st.metric("Min Time", f"{metrics['min_time']:.2f}s")
+                        with col4:
+                            st.metric("Total Requests", metrics['total_requests'])
+            else:
+                st.info("No performance data available yet. Use search or browse to generate metrics.")
+            
+            # Reset metrics button
+            if st.button("🔄 Reset Performance Metrics"):
+                pagination_manager.performance_metrics.clear()
+                st.success("Performance metrics reset!")
+        else:
+            st.warning("Performance monitoring not available - pagination module not loaded")
 
 
 def show_document_details(document: Dict):
@@ -689,7 +912,7 @@ def show_document_details(document: Dict):
     with col2:
         st.write(f"**Word Count:** {document.get('word_count', 'N/A')}")
         st.write(f"**Created:** {document.get('created_at', 'N/A')}")
-        st.write(f"**Categories:** {document.get('categories', 'Uncategorized')}")
+        st.write(f"**Language:** {document.get('language', 'N/A')}")
     
     # Content
     st.subheader("Content")

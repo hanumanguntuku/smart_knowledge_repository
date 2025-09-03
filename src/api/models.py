@@ -29,7 +29,6 @@ class QueryResponse(BaseModel):
     confidence: float
     knowledge_gaps: List[str]
     scope: str
-    domain: str
     intent: str
     query_analysis: Dict[str, Any]
 
@@ -37,8 +36,7 @@ class QueryResponse(BaseModel):
 class SearchRequest(BaseModel):
     """Request model for search queries"""
     query: str
-    category: Optional[str] = None
-    max_results: int = 10
+    max_results: int = 20
     search_type: str = "hybrid"
     min_score: Optional[float] = None
 
@@ -48,7 +46,6 @@ class SearchResult(BaseModel):
     title: str
     content: str
     url: Optional[str] = None
-    category: str
     content_type: str
     score: float
     created_at: Optional[str] = None
@@ -67,7 +64,6 @@ class DocumentRequest(BaseModel):
     title: str
     content: str
     url: Optional[str] = None
-    category: str = "General"
     content_type: str = "text"
     metadata: Optional[Dict[str, Any]] = None
 
@@ -82,7 +78,6 @@ class DocumentResponse(BaseModel):
 class SystemStats(BaseModel):
     """System statistics model"""
     documents_count: int
-    categories_count: int
     total_queries: int
     system_health: str
     last_updated: datetime

@@ -156,7 +156,6 @@ async def process_chat_query(
             confidence=response.get('confidence', 0.0),
             knowledge_gaps=response.get('knowledge_gaps', []),
             scope=response.get('scope', 'unknown'),
-            domain=response.get('domain', 'general'),
             intent=response.get('intent', 'unknown'),
             query_analysis=response.get('query_analysis', {})
         )
@@ -201,7 +200,6 @@ async def search_knowledge_base(
     try:
         results = search_engine.search(
             query=request.query,
-            category=request.category,
             max_results=request.max_results,
             search_type=request.search_type
         )
@@ -252,15 +250,13 @@ async def add_document(
 
 @app.get("/documents")
 async def get_documents(
-    category: Optional[str] = None,
-    limit: int = 20,
+    limit: int = 100,
     offset: int = 0,
     storage: StorageManager = Depends(get_storage_manager)
 ):
     """Get documents from the knowledge base"""
     try:
         documents = storage.get_documents(
-            category=category,
             limit=limit,
             offset=offset
         )
@@ -268,8 +264,7 @@ async def get_documents(
         return {
             "documents": documents,
             "limit": limit,
-            "offset": offset,
-            "category": category
+            "offset": offset
         }
         
     except Exception as e:
@@ -277,22 +272,10 @@ async def get_documents(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/documents/categories")
-async def get_categories(storage: StorageManager = Depends(get_storage_manager)):
-    """Get available document categories"""
-    try:
-        categories = storage.get_categories()
-        return {"categories": categories}
-    except Exception as e:
-        logger.error(f"Error getting categories: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 # Web scraping endpoints
 @app.post("/scrape")
 async def scrape_url(
     url: str,
-    category: str = "General",
     scraper: WebScraper = Depends(get_web_scraper),
     storage: StorageManager = Depends(get_storage_manager)
 ):
@@ -308,7 +291,6 @@ async def scrape_url(
                 title=doc.title,
                 content=doc.content,
                 url=doc.url,
-                category=category,
                 content_type='webpage'
             )
             

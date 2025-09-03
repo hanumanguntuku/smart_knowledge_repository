@@ -18,12 +18,12 @@ from ..core.config import config
 
 
 class ChromaDBClient:
-    """ChromaDB client for vector operations with domain-specific collections"""
+    """ChromaDB client for vector operations"""
     
     def __init__(self):
         self.logger = logging.getLogger(__name__)
         self.client = None
-        self.collections = {}
+        self.collection = None
         self.available = False
         
         if CHROMADB_AVAILABLE:
@@ -43,8 +43,8 @@ class ChromaDBClient:
                 )
             )
             
-            # Initialize domain collections
-            self._initialize_collections()
+            # Initialize main collection
+            self.initialize_collection()
             self.available = True
             self.logger.info(f"ChromaDB initialized successfully at {config.chroma_persist_directory}")
             
@@ -52,51 +52,44 @@ class ChromaDBClient:
             self.logger.error(f"Failed to initialize ChromaDB: {e}")
             self.available = False
     
-    def _initialize_collections(self):
-        """Initialize collections for different domains"""
-        domains = ["technology", "business", "science", "healthcare", "education", "general"]
-        
-        for domain in domains:
-            try:
-                collection_name = f"knowledge_base_{domain}"
-                
-                # Get or create collection
-                collection = self.client.get_or_create_collection(
-                    name=collection_name,
-                    metadata={"domain": domain, "hnsw:space": config.chroma_distance_metric}
-                )
-                
-                self.collections[domain] = collection
-                self.logger.debug(f"Initialized collection for domain: {domain}")
-                
-            except Exception as e:
-                self.logger.error(f"Failed to initialize collection for domain {domain}: {e}")
+    def initialize_collection(self):
+        """Initialize main collection"""
+        try:
+            collection_name = "knowledge_base"
+            
+            # Get or create collection
+            self.collection = self.client.get_or_create_collection(
+                name=collection_name,
+                metadata={"hnsw:space": config.chroma_distance_metric}
+            )
+            
+            self.logger.debug(f"Initialized main collection: {collection_name}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to initialize collection: {e}")
     
-    def get_collection_for_domain(self, domain: str):
-        """Get ChromaDB collection for specific domain"""
-        if not self.available:
-            return None
-            
-        domain = domain.lower() if domain else "general"
+    def delete_collection(self):
+        """Delete the collection to start fresh"""
+        if not self.available or not self.client:
+            return
         
-        # Default to general if domain not found
-        if domain not in self.collections:
-            domain = "general"
-            
-        return self.collections.get(domain)
+        try:
+            self.client.delete_collection("knowledge_base")
+            self.collection = None
+            self.logger.info("Deleted existing ChromaDB collection")
+        except Exception as e:
+            self.logger.debug(f"Collection might not exist: {e}")
     
     def add_embeddings(self, 
                       document_id: int, 
                       chunks: List[Dict], 
-                      embeddings: List[List[float]], 
-                      domain: str = "general") -> bool:
+                      embeddings: List[List[float]]) -> bool:
         """Add embeddings to ChromaDB collection"""
         if not self.available or not chunks or not embeddings:
             return False
         
         try:
-            collection = self.get_collection_for_domain(domain)
-            if not collection:
+            if not self.collection:
                 return False
             
             # Prepare data for ChromaDB
@@ -113,21 +106,20 @@ class ChromaDBClient:
                     'document_id': document_id,
                     'chunk_position': chunk['position'],
                     'chunk_type': chunk['type'],
-                    'domain': domain,
                     'length': len(chunk['text']),
                     'embedding_model': config.embedding_model
                 }
                 metadatas.append(metadata)
             
             # Add to collection
-            collection.add(
+            self.collection.add(
                 ids=ids,
                 embeddings=embeddings,
                 documents=documents,
                 metadatas=metadatas
             )
             
-            self.logger.info(f"Added {len(chunks)} embeddings for document {document_id} to {domain} collection")
+            self.logger.info(f"Added {len(chunks)} embeddings for document {document_id}")
             return True
             
         except Exception as e:
@@ -136,7 +128,6 @@ class ChromaDBClient:
     
     def search_similar(self, 
                       query_embedding: List[float], 
-                      domain: str = None, 
                       limit: int = 10,
                       where_filter: Dict = None) -> List[Dict]:
         """Search for similar embeddings in ChromaDB"""
@@ -144,44 +135,37 @@ class ChromaDBClient:
             return []
         
         try:
+            if not self.collection:
+                return []
+            
+            # Perform similarity search
+            search_results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=limit,
+                where=where_filter,
+                include=['documents', 'metadatas', 'distances']
+            )
+            
             results = []
-            
-            # Search in specific domain or all domains
-            domains_to_search = [domain] if domain else self.collections.keys()
-            
-            for search_domain in domains_to_search:
-                collection = self.get_collection_for_domain(search_domain)
-                if not collection:
-                    continue
-                
-                # Perform similarity search
-                search_results = collection.query(
-                    query_embeddings=[query_embedding],
-                    n_results=limit,
-                    where=where_filter,
-                    include=['documents', 'metadatas', 'distances']
-                )
-                
-                # Process results
-                if search_results['ids'] and search_results['ids'][0]:
-                    for i, chunk_id in enumerate(search_results['ids'][0]):
-                        distance = search_results['distances'][0][i]
-                        
-                        # Convert distance to similarity score (for L2 distance)
-                        # For L2: smaller distance = higher similarity
-                        similarity = 1.0 / (1.0 + distance)
-                        
-                        result = {
-                            'chunk_id': chunk_id,
-                            'document_id': search_results['metadatas'][0][i]['document_id'],
-                            'chunk_text': search_results['documents'][0][i],
-                            'chunk_position': search_results['metadatas'][0][i]['chunk_position'],
-                            'similarity': similarity,
-                            'distance': distance,
-                            'domain': search_results['metadatas'][0][i]['domain'],
-                            'metadata': search_results['metadatas'][0][i]
-                        }
-                        results.append(result)
+            # Process results
+            if search_results['ids'] and search_results['ids'][0]:
+                for i, chunk_id in enumerate(search_results['ids'][0]):
+                    distance = search_results['distances'][0][i]
+                    
+                    # Convert distance to similarity score (for L2 distance)
+                    # For L2: smaller distance = higher similarity
+                    similarity = 1.0 / (1.0 + distance)
+                    
+                    result = {
+                        'chunk_id': chunk_id,
+                        'document_id': search_results['metadatas'][0][i]['document_id'],
+                        'chunk_text': search_results['documents'][0][i],
+                        'chunk_position': search_results['metadatas'][0][i]['chunk_position'],
+                        'similarity': similarity,
+                        'distance': distance,
+                        'metadata': search_results['metadatas'][0][i]
+                    }
+                    results.append(result)
             
             # Sort by similarity and return top results
             results.sort(key=lambda x: x['similarity'], reverse=True)
@@ -191,28 +175,21 @@ class ChromaDBClient:
             self.logger.error(f"Failed to search ChromaDB: {e}")
             return []
     
-    def delete_document_embeddings(self, document_id: int, domain: str = None) -> bool:
+    def delete_document_embeddings(self, document_id: int) -> bool:
         """Delete all embeddings for a specific document"""
-        if not self.available:
+        if not self.available or not self.collection:
             return False
         
         try:
-            domains_to_clean = [domain] if domain else self.collections.keys()
+            # Find all chunks for this document
+            results = self.collection.get(
+                where={"document_id": document_id},
+                include=['ids']
+            )
             
-            for search_domain in domains_to_clean:
-                collection = self.get_collection_for_domain(search_domain)
-                if not collection:
-                    continue
-                
-                # Find all chunks for this document
-                results = collection.get(
-                    where={"document_id": document_id},
-                    include=['ids']
-                )
-                
-                if results['ids']:
-                    collection.delete(ids=results['ids'])
-                    self.logger.info(f"Deleted {len(results['ids'])} embeddings for document {document_id}")
+            if results['ids']:
+                self.collection.delete(ids=results['ids'])
+                self.logger.info(f"Deleted {len(results['ids'])} embeddings for document {document_id}")
             
             return True
             
@@ -220,23 +197,19 @@ class ChromaDBClient:
             self.logger.error(f"Failed to delete embeddings for document {document_id}: {e}")
             return False
     
-    def get_collection_stats(self) -> Dict[str, Dict]:
-        """Get statistics for all collections"""
-        if not self.available:
+    def get_collection_stats(self) -> Dict:
+        """Get statistics for the main collection"""
+        if not self.available or not self.collection:
             return {}
         
-        stats = {}
-        for domain, collection in self.collections.items():
-            try:
-                count = collection.count()
-                stats[domain] = {
-                    'document_count': count,
-                    'collection_name': collection.name
-                }
-            except Exception as e:
-                stats[domain] = {'error': str(e)}
-        
-        return stats
+        try:
+            count = self.collection.count()
+            return {
+                'document_count': count,
+                'collection_name': self.collection.name
+            }
+        except Exception as e:
+            return {'error': str(e)}
     
     def backup_collections(self, backup_path: str) -> bool:
         """Backup ChromaDB collections"""

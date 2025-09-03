@@ -46,16 +46,24 @@ class Settings:
         self.chunk_size = int(os.getenv("CHUNK_SIZE", "500"))
         self.chunk_overlap = int(os.getenv("CHUNK_OVERLAP", "50"))
         
-        # LLM settings for chatbot
+        # AI/LLM settings for RAG
         self.openai_api_key = os.getenv("OPENAI_API_KEY", "")
         self.openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        self.use_openai = os.getenv("USE_OPENAI", "false").lower() == "true"
-        self.local_llm_model = os.getenv("LOCAL_LLM_MODEL", "microsoft/DialoGPT-medium")
+        self.use_openai = os.getenv("USE_OPENAI", "true").lower() == "true"
+        self.use_openai_embeddings = os.getenv("USE_OPENAI_EMBEDDINGS", "true").lower() == "true"
+        
+        # Google Gemini settings for AI fallback
+        self.gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+        self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-pro")
+        self.use_gemini_fallback = os.getenv("USE_GEMINI_FALLBACK", "true").lower() == "true"
+        self.embedding_fallback = os.getenv("EMBEDDING_FALLBACK", "gemini")  # gemini, local
+        
+        # Model parameters
         self.max_tokens = int(os.getenv("MAX_TOKENS", "500"))
         self.temperature = float(os.getenv("TEMPERATURE", "0.7"))
         
         # Search settings
-        self.max_results = int(os.getenv("MAX_RESULTS", "10"))
+        self.max_results = int(os.getenv("MAX_RESULTS", "20"))
         self.similarity_threshold = float(os.getenv("SIMILARITY_THRESHOLD", "0.7"))
         self.search_timeout = int(os.getenv("SEARCH_TIMEOUT", "30"))
         

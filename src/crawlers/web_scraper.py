@@ -137,7 +137,9 @@ class WebScraper:
             
             # Extract main content
             content = self._extract_content(soup)
-            if len(content.strip()) < 100:  # Skip pages with minimal content
+            
+            # Smart content quality check
+            if not self._is_quality_content(content, title):
                 return None
             
             # Extract metadata
@@ -318,3 +320,53 @@ class WebScraper:
                 loop.close()
             except:
                 pass
+
+    def _is_quality_content(self, content: str, title: str) -> bool:
+        """
+        Smart content quality assessment.
+        
+        Args:
+            content: The extracted content
+            title: The page title
+            
+        Returns:
+            bool: True if content appears to be quality, False otherwise
+        """
+        content_clean = content.strip()
+        
+        # Basic length checks
+        if len(content_clean) < 10:
+            return False
+            
+        # Very short content that might be valuable (product descriptions, etc.)
+        if 10 <= len(content_clean) <= 50:
+            # Allow if it has meaningful words and isn't just navigation
+            words = content_clean.split()
+            
+            # Skip common navigation/error patterns
+            low_quality_patterns = {
+                'loading', 'error', 'not found', 'contact us', 'home', 'about us',
+                'privacy policy', 'terms of service', 'login', 'signup', 'menu',
+                'navigation', 'footer', 'header', 'cookies', 'search'
+            }
+            
+            content_lower = content_clean.lower()
+            if any(pattern in content_lower for pattern in low_quality_patterns):
+                return False
+                
+            # Allow if it has at least 3 meaningful words
+            if len(words) >= 3:
+                return True
+                
+            return False
+        
+        # Medium length content (50-100 chars) - be more permissive
+        if 50 <= len(content_clean) <= 100:
+            # Skip if it's mostly repeated characters or very few words
+            words = content_clean.split()
+            if len(words) < 5:
+                return False
+            return True
+            
+        # Longer content - assume it's good
+        return True
