@@ -1,5 +1,6 @@
 """
 Scope-aware chatbot with domain detection and LLM integration
+Enhanced with conversation management and context optimization
 """
 import re
 import logging
@@ -7,6 +8,19 @@ from typing import Dict, List, Optional, Tuple, Union, Any
 from enum import Enum
 from datetime import datetime
 from ..core.config import config
+
+# Import conversation management components
+try:
+    from .conversation_manager import ConversationContextManager
+    CONVERSATION_MANAGER_AVAILABLE = True
+except ImportError:
+    CONVERSATION_MANAGER_AVAILABLE = False
+
+try:
+    from ..storage.conversation_storage import ConversationStorageManager
+    CONVERSATION_STORAGE_AVAILABLE = True
+except ImportError:
+    CONVERSATION_STORAGE_AVAILABLE = False
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -201,11 +215,26 @@ class DomainDetector:
 class ScopeAwareChatbot:
     """Chatbot with scope awareness, domain detection, and LLM integration"""
     
-    def __init__(self, storage_manager, search_engine):
+    def __init__(self, storage_manager, search_engine, session_id: str = None):
         self.storage_manager = storage_manager
         self.search_engine = search_engine
         self.domain_detector = DomainDetector(config.knowledge_domains)
         self.conversation_context = []
+        self.session_id = session_id or f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        # Initialize conversation management if available
+        if CONVERSATION_MANAGER_AVAILABLE and CONVERSATION_STORAGE_AVAILABLE:
+            self.context_manager = ConversationContextManager()
+            self.conversation_storage = ConversationStorageManager()
+            self.conversation_enabled = True
+            self.current_thread_id = self.conversation_storage.get_or_create_active_thread(self.session_id)
+            logger.info(f"✅ Conversation management enabled for session {self.session_id}")
+        else:
+            self.context_manager = None
+            self.conversation_storage = None
+            self.conversation_enabled = False
+            self.current_thread_id = None
+            logger.warning("⚠️ Conversation management not available - using basic mode")
         
         # Initialize LLM
         self.llm_client = self._initialize_llm()
@@ -246,30 +275,71 @@ class ScopeAwareChatbot:
         
     def process_query(self, query: str, user_context: Dict = None) -> Dict:
         """Process user query with enhanced analysis and response generation"""
-        # Enhanced query analysis
-        query_analysis = self.domain_detector.analyze_query(query)
-        
-        # Analyze scope based on enhanced analysis
-        scope_result = self._analyze_query_scope_enhanced(query, query_analysis)
-        
-        # Update conversation context early for better context resolution
-        self._add_to_conversation_context('user', query, query_analysis)
-        
-        if scope_result['scope'] == QueryScope.OUT_OF_SCOPE:
-            response = self._handle_out_of_scope_query(query, scope_result)
-        elif scope_result['scope'] == QueryScope.CLARIFICATION_NEEDED:
-            response = self._request_clarification(query, scope_result)
-        else:
-            response = self._handle_in_scope_query_enhanced(query, scope_result, query_analysis, user_context)
-        
-        # Add assistant response to context
-        self._add_to_conversation_context('assistant', response.get('response', ''), {
-            'sources': response.get('sources', []),
-            'confidence': response.get('confidence', 0),
-            'citations': response.get('citations', [])
-        })
-        
-        return response
+        try:
+            # Enhanced conversation context analysis if available
+            if self.conversation_enabled and self.context_manager:
+                context_analysis = self.context_manager.analyze_query_context(
+                    query, self.current_thread_id, self.session_id
+                )
+                
+                # Use resolved query if available
+                enhanced_query = context_analysis.get('resolved_query', query)
+                
+                # Save user message to conversation
+                self.conversation_storage.save_message(
+                    self.current_thread_id, 'user', query, 
+                    metadata={'context_analysis': context_analysis}
+                )
+            else:
+                enhanced_query = query
+                context_analysis = {'context_needed': False, 'is_follow_up': False}
+            
+            # Enhanced query analysis
+            query_analysis = self.domain_detector.analyze_query(enhanced_query)
+            
+            # Analyze scope based on enhanced analysis
+            scope_result = self._analyze_query_scope_enhanced(enhanced_query, query_analysis)
+            
+            # Update conversation context early for better context resolution
+            self._add_to_conversation_context('user', query, query_analysis)
+            
+            if scope_result['scope'] == QueryScope.OUT_OF_SCOPE:
+                response = self._handle_out_of_scope_query(enhanced_query, scope_result)
+            elif scope_result['scope'] == QueryScope.CLARIFICATION_NEEDED:
+                response = self._request_clarification(enhanced_query, scope_result)
+            else:
+                response = self._handle_in_scope_query_enhanced(enhanced_query, scope_result, query_analysis, user_context)
+            
+            # Save assistant response to conversation if available
+            if self.conversation_enabled and self.conversation_storage:
+                self.conversation_storage.save_message(
+                    self.current_thread_id, 'assistant', response.get('response', ''),
+                    sources=response.get('sources', []),
+                    metadata={
+                        'confidence': response.get('confidence', 0),
+                        'citations': response.get('citations', []),
+                        'context_analysis': context_analysis
+                    }
+                )
+            
+            # Add assistant response to context
+            self._add_to_conversation_context('assistant', response.get('response', ''), {
+                'sources': response.get('sources', []),
+                'confidence': response.get('confidence', 0),
+                'citations': response.get('citations', [])
+            })
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"❌ Error processing query: {e}")
+            return {
+                'response': "I apologize, but I encountered an error processing your request. Please try again.",
+                'sources': [],
+                'confidence': 0.0,
+                'scope': QueryScope.OUT_OF_SCOPE,
+                'error': str(e)
+            }
     
     def _analyze_query_scope_enhanced(self, query: str, query_analysis: Dict) -> Dict:
         """Enhanced scope analysis using query understanding"""
@@ -1163,3 +1233,112 @@ This information comes from {len(scope_result.get('relevant_docs_count', 0))} re
         except Exception as e:
             logger.error(f"Error generating response: {e}")
             return "I'm sorry, I encountered an error while processing your question. Please try again."
+
+    # Conversation Management Methods
+    
+    def get_conversation_history(self, limit: int = 10) -> List[Dict]:
+        """Get conversation history for current thread"""
+        if not self.conversation_enabled:
+            return self.conversation_context[-limit:]
+        
+        try:
+            return self.conversation_storage.get_conversation_history(self.current_thread_id, limit)
+        except Exception as e:
+            logger.error(f"❌ Error getting conversation history: {e}")
+            return []
+    
+    def start_new_conversation(self, title: str = None) -> bool:
+        """Start a new conversation thread"""
+        if not self.conversation_enabled:
+            self.conversation_context = []
+            return True
+        
+        try:
+            self.current_thread_id = self.conversation_storage.create_conversation_thread(
+                self.session_id, title
+            )
+            return self.current_thread_id is not None
+        except Exception as e:
+            logger.error(f"❌ Error starting new conversation: {e}")
+            return False
+    
+    def get_user_conversations(self, limit: int = 20) -> List[Dict]:
+        """Get all conversations for current user"""
+        if not self.conversation_enabled:
+            return []
+        
+        try:
+            return self.conversation_storage.get_user_conversations(self.session_id, limit)
+        except Exception as e:
+            logger.error(f"❌ Error getting user conversations: {e}")
+            return []
+    
+    def switch_conversation(self, thread_id: int) -> bool:
+        """Switch to a different conversation thread"""
+        if not self.conversation_enabled:
+            return False
+        
+        try:
+            # Verify thread belongs to current session
+            conversations = self.get_user_conversations()
+            valid_thread = any(conv['id'] == thread_id for conv in conversations)
+            
+            if valid_thread:
+                self.current_thread_id = thread_id
+                logger.info(f"🔄 Switched to conversation thread {thread_id}")
+                return True
+            else:
+                logger.warning(f"❌ Unauthorized access to thread {thread_id}")
+                return False
+        except Exception as e:
+            logger.error(f"❌ Error switching conversation: {e}")
+            return False
+    
+    def delete_conversation(self, thread_id: int) -> bool:
+        """Delete a conversation thread"""
+        if not self.conversation_enabled:
+            return False
+        
+        try:
+            success = self.conversation_storage.delete_conversation(thread_id, self.session_id)
+            
+            # If current conversation was deleted, create new one
+            if success and thread_id == self.current_thread_id:
+                self.current_thread_id = self.conversation_storage.get_or_create_active_thread(self.session_id)
+            
+            return success
+        except Exception as e:
+            logger.error(f"❌ Error deleting conversation: {e}")
+            return False
+    
+    def search_conversations(self, query: str, limit: int = 10) -> List[Dict]:
+        """Search conversations by content"""
+        if not self.conversation_enabled:
+            return []
+        
+        try:
+            return self.conversation_storage.search_conversations(self.session_id, query, limit)
+        except Exception as e:
+            logger.error(f"❌ Error searching conversations: {e}")
+            return []
+    
+    def get_follow_up_suggestions(self) -> List[str]:
+        """Get follow-up question suggestions based on last response"""
+        if not self.conversation_enabled or not self.context_manager:
+            return []
+        
+        try:
+            history = self.get_conversation_history(limit=5)
+            if not history:
+                return []
+            
+            # Get last assistant response
+            assistant_messages = [msg for msg in history if msg['role'] == 'assistant']
+            if not assistant_messages:
+                return []
+            
+            last_response = assistant_messages[-1]
+            return self.context_manager.suggest_follow_up_questions(last_response, history)
+        except Exception as e:
+            logger.error(f"❌ Error getting follow-up suggestions: {e}")
+            return []

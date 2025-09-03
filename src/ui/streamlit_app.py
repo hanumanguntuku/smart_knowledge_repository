@@ -101,6 +101,104 @@ if 'conversation_history' not in st.session_state:
     st.session_state.conversation_history = []
 
 
+def display_enhanced_stats():
+    """Display enhanced repository statistics with comprehensive metrics"""
+    stats = st.session_state.storage_manager.get_statistics()
+    
+    st.subheader("📊 Repository Statistics")
+    
+    # Create 4 columns for organized display
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.markdown("**📄 Documents**")
+        active_docs = stats.get('documents', {}).get('active', 0)
+        deleted_docs = stats.get('documents', {}).get('deleted', 0)
+        total_docs = active_docs + deleted_docs
+        
+        st.metric("Active", active_docs)
+        st.metric("Deleted", deleted_docs)
+        st.metric("Total", total_docs)
+    
+    with col2:
+        st.markdown("**📝 Content**")
+        total_words = stats.get('total_words', 0)
+        total_chars = stats.get('total_characters', 0)
+        avg_words = stats.get('avg_words_per_doc', 0)
+        
+        st.metric("Total Words", f"{total_words:,}")
+        st.metric("Total Characters", f"{total_chars:,}")
+        st.metric("Avg Words/Doc", f"{avg_words:.1f}")
+    
+    with col3:
+        st.markdown("**🌐 Collection**")
+        unique_domains = stats.get('unique_domains', 0)
+        recent_docs = stats.get('recent_documents', 0)
+        
+        st.metric("Unique Domains", unique_domains)
+        st.metric("Added This Week", recent_docs)
+        
+        # Calculate storage health indicator
+        if total_docs > 0:
+            active_ratio = (active_docs / total_docs) * 100
+            st.metric("Active Ratio", f"{active_ratio:.1f}%")
+        else:
+            st.metric("Active Ratio", "0%")
+    
+    with col4:
+        st.markdown("**⚡ Quick Actions**")
+        if st.button("🔄 Refresh Stats", help="Update statistics"):
+            st.rerun()
+        
+        if st.button("🗑️ Clean Deleted", help="Permanently remove deleted documents"):
+            with st.spinner("Cleaning deleted documents..."):
+                try:
+                    # Get count of deleted documents before cleanup
+                    stats = st.session_state.storage_manager.get_statistics()
+                    deleted_count = stats.get('deleted_documents', 0)
+                    
+                    if deleted_count == 0:
+                        st.info("No deleted documents to clean up.")
+                    else:
+                        # Clean all deleted documents (force permanent deletion)
+                        cleaned_count = cleanup_all_deleted_documents()
+                        if cleaned_count > 0:
+                            st.success(f"✅ Successfully cleaned {cleaned_count} deleted documents!")
+                            st.rerun()
+                        else:
+                            st.warning("No documents were cleaned. They may already be permanently deleted.")
+                except Exception as e:
+                    st.error(f"❌ Error during cleanup: {str(e)}")
+                    st.session_state.storage_manager.logger.error(f"Cleanup error: {e}")
+        
+        # Last update indicator
+        st.caption(f"📅 Updated: {datetime.now().strftime('%H:%M:%S')}")
+    
+    # Add a separator
+    st.divider()
+
+
+def cleanup_all_deleted_documents():
+    """Clean up all soft-deleted documents by permanently removing them"""
+    try:
+        from src.core.database import DatabaseManager
+        db = DatabaseManager()
+        
+        # Get all deleted documents
+        query = "SELECT id FROM documents WHERE status = 'deleted'"
+        deleted_docs = db.execute_query(query)
+        
+        count = 0
+        for doc in deleted_docs:
+            if st.session_state.storage_manager.delete_document(doc['id'], soft_delete=False):
+                count += 1
+                
+        return count
+    except Exception as e:
+        st.session_state.storage_manager.logger.error(f"Error in cleanup_all_deleted_documents: {e}")
+        return 0
+
+
 def main():
     """Main application interface"""
     st.title("🧠 Smart Knowledge Repository")
@@ -114,16 +212,6 @@ def main():
             ["🔍 Search", "📚 Browse Documents", "💬 Chat Interface", 
              "⚙️ Data Management", "📊 Analytics", "🔧 Settings"]
         )
-        
-        # Quick stats
-        st.subheader("📈 Quick Stats")
-        stats = st.session_state.storage_manager.get_statistics()
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Documents", stats.get('documents', {}).get('active', 0))
-        with col2:
-            st.metric("Total Words", stats.get('total_words', 0))
     
     # Route to appropriate page
     if page == "🔍 Search":
@@ -256,6 +344,9 @@ def browse_documents_page():
     """Browse documents page"""
     st.header("📚 Document Library")
     
+    # Display repository statistics at the top
+    display_enhanced_stats()
+    
     # Filters
     col1, col2, col3 = st.columns(3)
     
@@ -348,26 +439,136 @@ def browse_documents_page():
 
 
 def chat_interface_page():
-    """Chat interface for AI-powered queries"""
+    """Enhanced AI chat interface with conversation management"""
     st.header("💬 AI Knowledge Chat")
     
-    # Chat configuration
-    col1, col2 = st.columns([2, 1])
+    # Initialize session ID if not exists
+    if 'session_id' not in st.session_state:
+        st.session_state.session_id = f"streamlit_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    # Initialize enhanced chatbot with session ID
+    if 'enhanced_chatbot' not in st.session_state:
+        try:
+            from src.ai.scope_chatbot import ScopeAwareChatbot
+            st.session_state.enhanced_chatbot = ScopeAwareChatbot(
+                st.session_state.storage_manager,
+                st.session_state.search_engine,
+                session_id=st.session_state.session_id
+            )
+        except Exception as e:
+            st.error(f"❌ Error initializing enhanced chatbot: {e}")
+            st.session_state.enhanced_chatbot = st.session_state.chatbot  # Fallback
+    
+    # Sidebar for conversation management
+    with st.sidebar:
+        st.subheader("� Conversations")
+        
+        # New conversation button
+        if st.button("➕ New Conversation"):
+            if hasattr(st.session_state.enhanced_chatbot, 'start_new_conversation'):
+                st.session_state.enhanced_chatbot.start_new_conversation()
+                st.session_state.conversation_history = []
+                st.rerun()
+        
+        # Conversation list
+        try:
+            if hasattr(st.session_state.enhanced_chatbot, 'get_user_conversations'):
+                conversations = st.session_state.enhanced_chatbot.get_user_conversations(limit=10)
+                
+                if conversations:
+                    st.subheader("Recent Conversations")
+                    for conv in conversations:
+                        conv_title = conv.get('title', f"Conversation {conv['id']}")[:30]
+                        if len(conv_title) < len(conv.get('title', '')):
+                            conv_title += "..."
+                        
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            if st.button(conv_title, key=f"conv_{conv['id']}", 
+                                       help=f"Messages: {conv.get('total_messages', 0)}"):
+                                if st.session_state.enhanced_chatbot.switch_conversation(conv['id']):
+                                    st.session_state.conversation_history = []
+                                    st.rerun()
+                        
+                        with col2:
+                            if st.button("🗑️", key=f"del_{conv['id']}", 
+                                       help="Delete conversation"):
+                                if st.session_state.enhanced_chatbot.delete_conversation(conv['id']):
+                                    st.rerun()
+                
+                # Export options
+                st.divider()
+                st.subheader("📤 Export")
+                
+                export_format = st.selectbox("Format:", ["JSON", "Markdown", "PDF"])
+                
+                if st.button("📥 Export Current Chat"):
+                    export_conversation(export_format.lower())
+                
+                # Search conversations
+                st.divider()
+                search_query = st.text_input("🔍 Search conversations:", 
+                                           placeholder="Search your chat history...")
+                
+                if search_query and hasattr(st.session_state.enhanced_chatbot, 'search_conversations'):
+                    search_results = st.session_state.enhanced_chatbot.search_conversations(search_query)
+                    if search_results:
+                        st.write("**Search Results:**")
+                        for result in search_results[:5]:
+                            if st.button(f"📄 {result.get('title', 'Untitled')[:25]}...", 
+                                       key=f"search_{result['id']}"):
+                                if st.session_state.enhanced_chatbot.switch_conversation(result['id']):
+                                    st.rerun()
+        
+        except Exception as e:
+            st.error(f"❌ Conversation management error: {e}")
+    
+    # Main chat interface
+    col1, col2 = st.columns([3, 1])
     
     with col1:
-        st.info("Ask questions about your knowledge base and get AI-powered responses!")
+        # Show current conversation context
+        if hasattr(st.session_state.enhanced_chatbot, 'conversation_enabled') and \
+           st.session_state.enhanced_chatbot.conversation_enabled:
+            st.info("💡 Enhanced conversation mode with context awareness and follow-up handling")
+        else:
+            st.info("ℹ️ Basic chat mode - Ask questions about your knowledge base")
     
     with col2:
-        if st.button("🗑️ Clear Chat"):
+        if st.button("🗑️ Clear Current Chat"):
             st.session_state.conversation_history = []
+            if hasattr(st.session_state.enhanced_chatbot, 'start_new_conversation'):
+                st.session_state.enhanced_chatbot.start_new_conversation()
             st.rerun()
     
-    # Display conversation history
+    # Get conversation history for display
+    try:
+        if hasattr(st.session_state.enhanced_chatbot, 'get_conversation_history'):
+            # Get persistent conversation history
+            persistent_history = st.session_state.enhanced_chatbot.get_conversation_history(limit=20)
+            
+            # Convert to display format
+            display_history = []
+            for msg in persistent_history:
+                display_history.append({
+                    'type': msg['role'],
+                    'content': msg['content'],
+                    'sources': msg.get('sources', []),
+                    'timestamp': msg.get('timestamp')
+                })
+            
+            # Use persistent history if available, otherwise fallback to session state
+            if display_history:
+                st.session_state.conversation_history = display_history
+    except Exception as e:
+        st.warning(f"⚠️ Using session-based chat history: {e}")
+    
+    # Display conversation
     chat_container = st.container()
     
     with chat_container:
         for message in st.session_state.conversation_history:
-            if message['type'] == 'user':
+            if message['type'] in ['user', 'User']:
                 with st.chat_message("user"):
                     st.write(message['content'])
             else:
@@ -375,33 +576,130 @@ def chat_interface_page():
                     st.write(message['content'])
                     
                     # Show sources if available
-                    if message.get('sources'):
+                    sources = message.get('sources', [])
+                    if sources:
                         with st.expander("📚 Sources"):
-                            for source in message['sources']:
-                                st.write(f"• {source.get('title', 'Unknown')} (Score: {source.get('final_score', 0):.2f})")
+                            for i, source in enumerate(sources, 1):
+                                if isinstance(source, dict):
+                                    title = source.get('title', 'Unknown Source')
+                                    score = source.get('final_score', source.get('score', 0))
+                                    url = source.get('url', '')
+                                    st.write(f"{i}. **{title}** (Relevance: {score:.2f})")
+                                    if url:
+                                        st.caption(f"🔗 {url}")
+                                else:
+                                    st.write(f"{i}. {source}")
+    
+    # Follow-up suggestions
+    try:
+        if hasattr(st.session_state.enhanced_chatbot, 'get_follow_up_suggestions'):
+            suggestions = st.session_state.enhanced_chatbot.get_follow_up_suggestions()
+            if suggestions:
+                st.subheader("💡 Suggested Follow-ups")
+                cols = st.columns(min(len(suggestions), 3))
+                for i, suggestion in enumerate(suggestions[:3]):
+                    with cols[i]:
+                        if st.button(f"💬 {suggestion[:30]}...", key=f"suggest_{i}"):
+                            # Trigger follow-up question
+                            process_chat_input(suggestion)
+                            st.rerun()
+    except Exception:
+        pass  # Suggestions are optional
     
     # Chat input
     if prompt := st.chat_input("Ask me anything about your knowledge base..."):
-        # Add user message
+        process_chat_input(prompt)
+        st.rerun()
+
+
+def process_chat_input(prompt: str):
+    """Process chat input and generate response"""
+    try:
+        # Add user message to history
         st.session_state.conversation_history.append({
             'type': 'user',
             'content': prompt,
-            'timestamp': datetime.now()
+            'timestamp': datetime.now().isoformat()
         })
         
-        # Generate AI response
+        # Generate AI response using enhanced chatbot
         with st.spinner("🤔 Thinking..."):
-            response = generate_ai_response(prompt)
+            if hasattr(st.session_state.enhanced_chatbot, 'process_query'):
+                # Use enhanced chatbot with conversation management
+                response = st.session_state.enhanced_chatbot.process_query(prompt)
+            else:
+                # Fallback to basic chatbot
+                response = generate_ai_response(prompt)
         
-        # Add assistant response
+        # Add assistant response to history
         st.session_state.conversation_history.append({
             'type': 'assistant',
-            'content': response['response'],
+            'content': response.get('response', 'I apologize, I could not generate a response.'),
             'sources': response.get('sources', []),
-            'timestamp': datetime.now()
+            'timestamp': datetime.now().isoformat()
         })
         
-        st.rerun()
+    except Exception as e:
+        st.error(f"❌ Error processing chat input: {e}")
+        st.session_state.conversation_history.append({
+            'type': 'assistant',
+            'content': "I apologize, but I encountered an error processing your question. Please try again.",
+            'sources': [],
+            'timestamp': datetime.now().isoformat()
+        })
+
+
+def export_conversation(format_type: str = "json"):
+    """Export current conversation"""
+    try:
+        from src.services.conversation_export import ConversationExportService
+        
+        export_service = ConversationExportService()
+        
+        if hasattr(st.session_state.enhanced_chatbot, 'current_thread_id') and \
+           st.session_state.enhanced_chatbot.current_thread_id:
+            
+            thread_id = st.session_state.enhanced_chatbot.current_thread_id
+            session_id = st.session_state.session_id
+            
+            if format_type == "json":
+                filepath = export_service.export_conversation_json(thread_id, session_id)
+            elif format_type == "markdown":
+                filepath = export_service.export_conversation_markdown(thread_id, session_id)
+            elif format_type == "pdf":
+                filepath = export_service.export_conversation_pdf(thread_id, session_id)
+            else:
+                st.error("❌ Unsupported export format")
+                return
+            
+            if filepath:
+                st.success(f"✅ Conversation exported to: {filepath}")
+                
+                # Offer download
+                with open(filepath, 'rb') as f:
+                    st.download_button(
+                        label=f"📥 Download {format_type.upper()} File",
+                        data=f.read(),
+                        file_name=Path(filepath).name,
+                        mime=get_mime_type(format_type)
+                    )
+            else:
+                st.error("❌ Export failed")
+        else:
+            st.warning("⚠️ No active conversation to export")
+    
+    except Exception as e:
+        st.error(f"❌ Export error: {e}")
+
+
+def get_mime_type(format_type: str) -> str:
+    """Get MIME type for file format"""
+    mime_types = {
+        'json': 'application/json',
+        'markdown': 'text/markdown',
+        'pdf': 'application/pdf'
+    }
+    return mime_types.get(format_type, 'text/plain')
 
 
 def generate_ai_response(query: str) -> dict:
@@ -418,6 +716,9 @@ def generate_ai_response(query: str) -> dict:
 def data_management_page():
     """Data management interface"""
     st.header("⚙️ Data Management")
+    
+    # Display enhanced statistics at the top
+    display_enhanced_stats()
     
     # Management tabs
     tab1, tab2, tab3 = st.tabs(["📤 Add Content", "🌐 Web Scraping", "📊 Bulk Operations"])

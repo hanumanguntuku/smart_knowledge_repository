@@ -22,30 +22,52 @@ tiktoken>=0.5.1  # For token counting
 
 # Vector storage and embeddings
 chromadb>=0.4.15
-# faiss-cpu>=1.7.4  # Optional fallback for vector operations
 
-# Web scraping and async HTTP
-aiohttp>=3.9.1
+# Web scraping and crawling - MISSING CRITICAL
+aiohttp>=3.8.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
+html5lib>=1.1
+
+# Data visualization - MISSING CRITICAL
+plotly>=5.17.0
+matplotlib>=3.7.0
+
+# Environment and configuration - MISSING CRITICAL
+python-dotenv>=1.0.0
+
+# File processing and export - MISSING FOR PDF EXPORT
+reportlab>=4.0.0  # For PDF generation in conversation export
+python-docx>=0.8.11
+PyPDF2>=3.0.0
+openpyxl>=3.1.0
 
 # Text processing and NLP
-nltk>=3.8.1
 spacy>=3.7.2
+nltk>=3.8.0
 langdetect>=1.0.9
 
-# Document processing
-PyPDF2>=3.0.1
-python-docx>=1.1.0
-python-multipart>=0.0.6
+# HTTP and API utilities
+httpx>=0.25.0
+urllib3>=2.0.0
 
-# UI and visualization
-plotly>=5.17.0
+# Date and time handling
+python-dateutil>=2.8.0
 
-# Environment and utilities
-python-dotenv>=1.0.0
+# Database utilities and async operations
+aiofiles>=23.2.0
+
+# Security and validation
+validators>=0.22.0
+cryptography>=41.0.0
+
+# Development and testing (optional)
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+black>=23.0.0
+flake8>=6.0.0
+
+# Additional utilities
 pyyaml>=6.0.1
-
-# Security (for future API features)
-python-jose>=3.3.0
+python-multipart>=0.0.6
 bcrypt>=4.1.2
